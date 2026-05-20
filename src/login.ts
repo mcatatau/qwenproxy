@@ -8,7 +8,7 @@
  * Modified By: Pedro Farias
  */
 
-import { initPlaywright, closePlaywright, activePage, loginToQwen, BrowserType } from './services/playwright.ts';
+import { initPlaywright, closePlaywright, activePage, BrowserType } from './services/playwright.ts';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -28,9 +28,10 @@ async function main() {
   if (email && password) {
     console.log(`[Login] Credentials found in .env. Attempting automated API login using ${browserType}...`);
     await initPlaywright(true, browserType);
-    const success = await loginToQwen(email, password);
-    if (success) {
-      console.log('[Login] Automated login successful! Session saved.');       
+    const cookies = await activePage?.context().cookies();
+    const hasAuthCookie = cookies?.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
+    if (hasAuthCookie) {
+      console.log('[Login] Automated login successful! Session saved.');
       await closePlaywright();
       process.exit(0);
     } else {
@@ -56,4 +57,4 @@ async function main() {
   });
 }
 
-main().catch(console.error);
+main();

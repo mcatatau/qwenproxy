@@ -171,7 +171,7 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   console.log(`[Playwright] Attempting API login for ${email}...`);
   
   // Navigate to auth page to set up context/cookies
-  await activePage.goto('https://chat.qwen.ai/auth', { waitUntil: 'networkidle' });
+  await activePage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
 
   // Qwen expects SHA256 hashed password
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
@@ -199,7 +199,7 @@ export async function loginToQwen(email: string, password: string): Promise<bool
   if (result.ok) {
     console.log('[Playwright] API login request successful.');
     // Navigate to home to confirm session
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'networkidle' });
+    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
     const isLogged = !(activePage.url().includes('auth') || activePage.url().includes('login'));
     if (isLogged) {
        console.log('[Playwright] Login confirmed.');

@@ -79,7 +79,6 @@ export async function startServer(): Promise<void> {
   
   if (accounts.length > 0) {
     console.log(`[Server] Pre-warming ${accounts.length} configured account(s) in parallel...`)
-    // Parallelize account initialization using Promise.all
     await Promise.all(
       accounts.map(account =>
         initPlaywrightForAccount(account, config.browser.headless).catch((err: any) => {
@@ -88,14 +87,8 @@ export async function startServer(): Promise<void> {
       )
     )
     console.log('[Server] Pre-fetching headers for all accounts in background...')
-    // Parallel header pre-fetching (no global context)
-    await Promise.all(
-      accounts.map(account =>
-        getQwenHeaders(false, account.id).catch(err => {
-          console.error(`[Server] Background header pre-fetch failed for ${account.email}:`, err.message)
-        })
-      )
-    )
+    const { warmAllPools } = await import('../services/qwen.ts')
+    warmAllPools(accounts.map(a => a.id)).catch(() => {})
   }
 
   watchdog = new Watchdog()

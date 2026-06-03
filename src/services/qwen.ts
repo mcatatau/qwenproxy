@@ -1,16 +1,8 @@
-/*
- * File: qwen.ts
- * Project: qwenproxy
- * Author: Pedro Farias
- * Created: 2026-05-12
- */
-
 import { getQwenHeaders, getBasicHeaders } from './playwright.ts';
 import { v4 as uuidv4 } from 'uuid';
 
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
-
   constructor(message: string, retryAfterMs: number) {
     super(message);
     this.name = 'RetryableQwenStreamError';
@@ -21,7 +13,6 @@ export class RetryableQwenStreamError extends Error {
 export class QwenUpstreamError extends Error {
   readonly upstreamCode: string;
   readonly upstreamStatus: number;
-
   constructor(message: string, upstreamCode: string, upstreamStatus: number) {
     super(message);
     this.name = 'QwenUpstreamError';
@@ -37,7 +28,6 @@ interface SessionEntry {
 
 const sessionStates: Map<string, SessionEntry> = (globalThis as any)._sessionStates || new Map();
 (globalThis as any)._sessionStates = sessionStates;
-
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 function cleanupStaleSessions() {
@@ -51,9 +41,7 @@ function cleanupStaleSessions() {
 
 export function updateSessionParent(sessionId: string, parentId: string | null) {
   if (sessionId) {
-    if (sessionStates.size > 10000) {
-      cleanupStaleSessions();
-    }
+    if (sessionStates.size > 10000) cleanupStaleSessions();
     sessionStates.set(sessionId, { parentId, timestamp: Date.now() });
   }
 }
@@ -66,6 +54,106 @@ function getSessionParent(sessionId: string): string | null | undefined {
     return undefined;
   }
   return entry.parentId;
+}
+
+interface WarmPoolEntry {
+  chatId: string;
+  headers: Record<string, string>;
+  accountId: string;
+  timestamp: number;
+}
+
+const warmPool: Map<string, WarmPoolEntry[]> = (globalThis as any)._warmPool || new Map();
+(globalThis as any)._warmPool = warmPool;
+
+const WARM_POOL_SIZE = 5;
+const WARM_POOL_TTL_MS = 10 * 60 * 1000;
+
+function cleanupStalePool(accountId: string) {
+  const pool = warmPool.get(accountId);
+  if (!pool) return;
+  const now = Date.now();
+  for (let i = pool.length - 1; i >= 0; i--) {
+    if (now - pool[i].timestamp > WARM_POOL_TTL_MS) pool.splice(i, 1);
+  }
+}
+
+async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, string>> {
+  const { getBasicHeaders } = await import('./playwright.ts');
+  const { cookie, userAgent, bxV } = await getBasicHeaders(accountId);
+  return {
+    cookie,
+    'user-agent': userAgent,
+    'bx-v': bxV,
+  };
+}
+
+async function createRealQwenChat(header: Record<string, string>): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  const response = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json, text/plain, */*',
+      'accept-language': 'pt-BR,pt;q=0.9',
+      'content-type': 'application/json',
+      cookie: header['cookie'],
+      origin: 'https://chat.qwen.ai',
+      referer: 'https://chat.qwen.ai/c/new-chat',
+      'user-agent': header['user-agent'],
+      'x-request-id': uuidv4(),
+      'bx-v': header['bx-v'],
+    },
+    body: JSON.stringify({
+      title: 'Nova Conversa',
+      models: ['qwen3.7-plus'],
+      chat_mode: 'normal',
+      chat_type: 't2t',
+      timestamp: Date.now(),
+      project_id: '',
+    }),
+    signal: controller.signal,
+  });
+  clearTimeout(timeoutId);
+
+  if (!response.ok) throw new Error(`Failed to create chat: ${response.status}`);
+  const json = await response.json();
+  const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+  if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
+  return chatId;
+}
+
+async function refillPoolForAccount(accountId: string) {
+  let pool = warmPool.get(accountId);
+  if (!pool) { pool = []; warmPool.set(accountId, pool); }
+  cleanupStalePool(accountId);
+  const need = Math.max(0, WARM_POOL_SIZE - pool.length);
+  for (let i = 0; i < need; i++) {
+    try {
+      const headers = await getBasicQwenHeaders(accountId === 'global' ? undefined : accountId);
+      const chatId = await createRealQwenChat(headers);
+      pool.push({ chatId, headers, accountId, timestamp: Date.now() });
+    } catch (err) {
+      console.error(`[WarmPool] refill failed for ${accountId}:`, (err as Error).message);
+      break;
+    }
+  }
+}
+
+export async function getWarmedChat(accountId?: string) {
+  const key = accountId || 'global';
+  let pool = warmPool.get(key);
+  if (!pool) { pool = []; warmPool.set(key, pool); }
+  cleanupStalePool(key);
+  if (pool.length === 0) {
+    await refillPoolForAccount(key);
+  }
+  if (pool.length === 0) throw new Error(`Warm pool empty for ${key}`);
+  return pool.shift()!;
+}
+
+export async function warmAllPools(accountIds: string[]) {
+  for (const id of accountIds) refillPoolForAccount(id).catch(() => {});
 }
 
 export interface QwenMessage {
@@ -124,7 +212,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
 
   try {
     const { headers } = await getQwenHeaders(false, accountId);
-    
+
     const payload = {
       tools_enabled: {
         web_extractor: false,
@@ -178,12 +266,12 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
 
 export async function fetchQwenModels(accountId?: string): Promise<any[]> {
   const now = Date.now();
-  if (cachedModels && (now - lastModelsFetch < 3600000)) { // 1 hour cache
+  if (cachedModels && (now - lastModelsFetch < 3600000)) {
     return cachedModels;
   }
 
   const { cookie, userAgent, bxV } = await getBasicHeaders(accountId);
-  
+
   const response = await fetch('https://chat.qwen.ai/api/models', {
     headers: {
       'accept': 'application/json, text/plain, */*',
@@ -211,13 +299,16 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
       owned_by: m.owned_by || 'qwen'
     }));
 
-    const extendedModels = [...models];
-    for (const m of models) {
-      extendedModels.push({
-        ...m,
-        id: `${m.id}-no-thinking`
-      });
-    }
+    const hasPlus = models.some((m: any) => m.id === 'qwen3.7-plus');
+    const base = [
+      ...models,
+      ...(hasPlus ? [] : [{ id: 'qwen3.7-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'qwen' }])
+    ];
+
+    const extendedModels = [
+      ...base,
+      ...base.map((m: any) => ({ ...m, id: `${m.id}-no-thinking` }))
+    ];
 
     cachedModels = extendedModels;
     lastModelsFetch = now;
@@ -234,19 +325,24 @@ export async function createQwenStream(
   forcedParentId?: string | null,
   accountId?: string
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, controller: AbortController, accountId: string }> {
-  const { headers, chatSessionId } = await getQwenHeaders(true, accountId);
-
-  if (!chatSessionId) {
-    throw new Error('Playwright did not return a valid chatSessionId. A sua sessão no Qwen pode ter expirado. Faça login novamente no navegador do Playwright.');
+  let chatEntry: WarmPoolEntry;
+  try {
+    chatEntry = await getWarmedChat(accountId);
+  } catch (err: any) {
+    if (err.message?.includes('chat is in progress') || err.message?.includes('The chat is in progress')) {
+      const retryAfterMs = 2000 + Math.floor(Math.random() * 2000);
+      throw new RetryableQwenStreamError(`Qwen: ${err.message}`, retryAfterMs);
+    }
+    throw err;
   }
 
+  const chatId = chatEntry.chatId;
+  const chatHeaders = chatEntry.headers;
   const actualParentId: string | null = null;
 
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
   const model = modelId.replace('-no-thinking', '');
-
-  const chatId = chatSessionId;
 
   const payload: QwenPayload = {
     stream: true,
@@ -290,7 +386,6 @@ export async function createQwenStream(
   };
 
   const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
-
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 120000);
   const response = await fetch(url, {
@@ -299,19 +394,17 @@ export async function createQwenStream(
       'accept': 'application/json',
       'accept-language': 'pt-BR,pt;q=0.9',
       'content-type': 'application/json',
-      'cookie': headers['cookie'],
+      'cookie': chatHeaders['cookie'],
       'origin': 'https://chat.qwen.ai',
-      'referer': 'https://chat.qwen.ai/',
+      'referer': `https://chat.qwen.ai/c/${chatId}`,
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
       'timezone': new Date().toString().split(' (')[0],
-      'user-agent': headers['user-agent'],
+      'user-agent': chatHeaders['user-agent'],
       'x-accel-buffering': 'no',
       'x-request-id': uuidv4(),
-      'bx-ua': headers['bx-ua'],
-      'bx-umidtoken': headers['bx-umidtoken'],
-      'bx-v': headers['bx-v']
+      'bx-v': chatHeaders['bx-v'],
     },
     body: JSON.stringify(payload),
     signal: controller.signal
@@ -352,7 +445,7 @@ export async function createQwenStream(
         }
         if (errorJson?.data?.details?.includes('is not exist') ||
             errorJson?.data?.details?.includes('not exist') ||
-            errorJson?.data?.details?.includes('does not exist')) {
+            errorJson.data?.details?.includes('does not exist')) {
           throw new RetryableQwenStreamError(
             `Qwen: ${errorJson.data.details}`,
             0,
@@ -368,7 +461,5 @@ export async function createQwenStream(
     throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
   }
 
-  // Extract chat_id from response headers if available, otherwise generate one
-  const responseChatId = response.headers.get('x-chat-id') || uuidv4();
-  return { stream: response.body, headers, uiSessionId: responseChatId, controller, accountId: accountId ?? 'global' };
+  return { stream: response.body, headers: chatHeaders, uiSessionId: chatId, controller, accountId: chatEntry.accountId };
 }

@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import { getDatabase } from './database.ts'
+import { config } from './config.js'
 
 export interface QwenAccount {
   id: string
@@ -7,10 +8,27 @@ export interface QwenAccount {
   password: string
 }
 
+let accountsCache: QwenAccount[] | null = null
+let accountsCacheTimestamp = 0
+const ACCOUNTS_CACHE_TTL = config.cache.defaultTTL * 1000
+
+function getCachedAccounts(): QwenAccount[] {
+  const now = Date.now()
+  if (!accountsCache || (now - accountsCacheTimestamp) > ACCOUNTS_CACHE_TTL) {
+    const db = getDatabase()
+    accountsCache = db.prepare('SELECT id, email, password FROM accounts ORDER BY created_at ASC').all() as QwenAccount[]
+    accountsCacheTimestamp = now
+  }
+  return accountsCache
+}
+
+export function invalidateAccountsCache(): void {
+  accountsCache = null
+  accountsCacheTimestamp = 0
+}
+
 export function loadAccounts(): QwenAccount[] {
-  const db = getDatabase()
-  const rows = db.prepare('SELECT id, email, password FROM accounts ORDER BY created_at ASC').all()
-  return rows as QwenAccount[]
+  return getCachedAccounts()
 }
 
 export function addAccount(email: string, password: string, id?: string): QwenAccount {
@@ -19,7 +37,6 @@ export function addAccount(email: string, password: string, id?: string): QwenAc
   }
 
   const db = getDatabase()
-
   const existing = db.prepare('SELECT id FROM accounts WHERE email = ?').get(email.trim())
   if (existing) {
     throw new Error(`Account with email ${email} already exists`)
@@ -37,17 +54,21 @@ export function addAccount(email: string, password: string, id?: string): QwenAc
     newAccount.password,
   )
 
+  invalidateAccountsCache()
   return newAccount
 }
 
 export function removeAccount(id: string): boolean {
   const db = getDatabase()
   const result = db.prepare('DELETE FROM accounts WHERE id = ?').run(id)
+  if (result.changes > 0) {
+    invalidateAccountsCache()
+  }
   return result.changes > 0
 }
 
 export function listAccounts(): QwenAccount[] {
-  return loadAccounts().map(a => ({ id: a.id, email: a.email, password: '***' }))
+  return getCachedAccounts().map(a => ({ id: a.id, email: a.email, password: '***' }))
 }
 
 export function getAccountCredentials(id: string): QwenAccount | undefined {

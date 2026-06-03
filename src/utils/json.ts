@@ -107,8 +107,8 @@ export function robustParseJSON(str: string): any {
     let aggressive = fixedJson.trim();
     if (aggressive.endsWith(',')) aggressive = aggressive.slice(0, -1);
     const { result: aggFixed, openBraces: ob, openBrackets: bk } = sanitizeAndBalance(aggressive);
-    try { return JSON.parse(closeBraces(aggFixed, ob, bk)); } catch {
-      throw e;
-    }
+  try { return JSON.parse(closeBraces(aggFixed, ob, bk)); } catch {
+    return null;
   }
+}
 }

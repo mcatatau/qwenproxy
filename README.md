@@ -219,37 +219,46 @@ qwenproxy/
 │   ├── index.ts                 # Entry point
 │   ├── login.ts                 # CLI de gerenciamento de contas
 │   ├── api/
-│   │   ├── server.ts            # Servidor Hono + startup
-│   │   └── models.ts            # Endpoints /v1/models
-│   ├── routes/
-│   │   └── chat.ts              # Handler /v1/chat/completions
-│   ├── services/
-│   │   ├── playwright.ts        # Automação de navegador
-│   │   └── qwen.ts              # Integração com API do Qwen
+│   │   ├── models.ts            # Endpoints /v1/models
+│   │   └── server.ts            # Servidor Hono + startup
+│   ├── cache/
+│   │   └── memory-cache.ts      # Cache em memória com TTL
 │   ├── core/
-│   │   ├── accounts.ts          # CRUD de contas (SQLite)
 │   │   ├── account-manager.ts   # Rotação round-robin + cooldowns
-│   │   ├── database.ts          # Conexão e migrations SQLite
+│   │   ├── accounts.ts          # CRUD de contas (SQLite)
 │   │   ├── config.ts            # Configuração com Zod
+│   │   ├── database.ts          # Conexão e migrations SQLite
 │   │   ├── logger.ts            # Logger estruturado
 │   │   ├── metrics.ts           # Coleta de métricas
 │   │   ├── model-registry.ts    # Registro de modelos e context windows
 │   │   ├── stream-registry.ts   # Tracking de streams ativos
 │   │   └── watchdog.ts          # Health monitoring
-│   ├── cache/
-│   │   └── memory-cache.ts      # Cache em memória com TTL
+│   ├── linter/
+│   │   ├── bar.ts               # Facade
+│   │   ├── extraction-engine.ts # Extraction engine
+│   │   ├── foo.ts               # Exports
+│   │   ├── index.ts             # Main public API
+│   │   ├── repair-normalize.ts  # Repair and normalize
+│   │   ├── safety-gate.ts       # Safety gate
+│   │   ├── streaming-state-machine.ts # Streaming state machine
+│   │   ├── structural-parser.ts # Structural parser
+│   │   └── types.ts             # Types
+│   ├── routes/
+│   │   └── chat.ts              # Handler /v1/chat/completions
+│   ├── services/
+│   │   ├── playwright.ts        # Automação de navegador
+│   │   └── qwen.ts              # Integração com API do Qwen
+│   ├── tests/                   # Testes automatizados
 │   ├── tools/
 │   │   ├── executor.ts          # Execução de ferramentas
-│   │   ├── registry.ts          # Registro de tools
 │   │   ├── parser.ts            # Parser de <tool_call> tags
+│   │   ├── registry.ts          # Registro de tools
 │   │   ├── schema.ts            # Validação JSON Schema
 │   │   └── types.ts             # Tipos do sistema de tools
-│   ├── utils/
-│   │   ├── json.ts              # Parser JSON robusto
-│   │   ├── context-truncation.ts # Truncamento de contexto
-│   │   └── types.ts             # Re-exports de tipos
-│   └── types/
-│       └── openai.ts            # Tipos compatíveis com OpenAI
+│   └── utils/
+│       ├── context-truncation.ts # Truncamento de contexto
+│       ├── json.ts              # Parser JSON robusto
+│       └── types.ts             # Re-exports de tipos
 ├── data/                        # Banco SQLite (gitignored)
 ├── qwen_profiles/               # Perfis de navegador por conta (gitignored)
 ├── Dockerfile

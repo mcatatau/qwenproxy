@@ -1,4 +1,5 @@
 import { QwenAccount, loadAccounts } from './accounts.ts'
+import { config } from './config.js'
 
 let currentIndex = 0
 
@@ -10,6 +11,24 @@ interface CooldownEntry {
 const cooldowns = new Map<string, CooldownEntry>()
 
 const DEFAULT_COOLDOWN_MS = 3 * 60 * 1000 // 3 minutes
+
+let accountsCache: QwenAccount[] | null = null
+let accountsCacheTimestamp = 0
+const ACCOUNTS_CACHE_TTL = config.cache.defaultTTL * 1000
+
+function getCachedAccounts(): QwenAccount[] {
+  const now = Date.now()
+  if (!accountsCache || (now - accountsCacheTimestamp) > ACCOUNTS_CACHE_TTL) {
+    accountsCache = loadAccounts()
+    accountsCacheTimestamp = now
+  }
+  return accountsCache
+}
+
+export function invalidateAccountsCache(): void {
+  accountsCache = null
+  accountsCacheTimestamp = 0
+}
 
 export function markAccountRateLimited(accountId: string, cooldownMs?: number, reason?: string): void {
   cooldowns.set(accountId, {
@@ -38,10 +57,14 @@ function isAccountOnCooldown(accountId: string): boolean {
   return getAccountCooldownInfo(accountId) !== null
 }
 
-export function getNextAccount(): QwenAccount | null {
-  const accounts = loadAccounts()
+export function getNextAccount(forceReset?: boolean): QwenAccount | null {
+  const accounts = getCachedAccounts()
   if (accounts.length === 0) {
     return null
+  }
+
+  if (forceReset) {
+    currentIndex = 0
   }
 
   for (let i = 0; i < accounts.length; i++) {
@@ -66,7 +89,7 @@ export function getNextAccount(): QwenAccount | null {
 }
 
 export function getNextAvailableAccount(skipAccountId?: string): QwenAccount | null {
-  const accounts = loadAccounts()
+  const accounts = getCachedAccounts()
   if (accounts.length === 0) return null
 
   for (let i = 0; i < accounts.length; i++) {
@@ -94,7 +117,7 @@ export function getNextAvailableAccount(skipAccountId?: string): QwenAccount | n
 }
 
 export function getAccountCount(): number {
-  return loadAccounts().length
+  return getCachedAccounts().length
 }
 
 export function getCooldownStatus(): Record<string, { remainingMs: number; reason: string }> {

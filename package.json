@@ -1,7 +1,7 @@
 {
   "name": "qwenproxy",
   "version": "1.0.0",
-  "description": "",
+  "description": "Local OpenAI-compatible proxy API that routes requests to Qwen (chat.qwen.ai) via Playwright browser automation.",
   "main": "index.js",
   "scripts": {
     "start": "npx tsx src/index.ts",
@@ -23,8 +23,6 @@
     "better-sqlite3": "^12.10.0",
     "dotenv": "^17.4.2",
     "hono": "^4.12.21",
-    "p-queue": "^9.3.0",
-    "piscina": "^5.1.4",
     "playwright": "^1.60.0",
     "tsx": "^4.22.3",
     "uuid": "^14.0.0",

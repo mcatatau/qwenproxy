@@ -17,22 +17,16 @@ import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
+import { QwenStreamParser, ParsedChunkResult } from '../utils/qwen-stream-parser.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
-import { Mutex } from '../services/playwright.ts';
 import { getModelContextWindow } from '../core/model-registry.js'
 import { truncateMessages, estimateTokenCount } from '../utils/context-truncation.ts';
 import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, getAccountCooldownInfo } from '../core/account-manager.ts';
 import { registerStream, removeStream, getStream } from '../core/stream-registry.ts';
 import { metrics } from '../core/metrics.js'
 
-const accountMutexes = new Map<string, Mutex>();
-function getAccountMutex(accountId: string): Mutex {
-  let mutex = accountMutexes.get(accountId);
-  if (!mutex) {
-    mutex = new Mutex();
-    accountMutexes.set(accountId, mutex);
-  }
-  return mutex;
+export function cleanupAllAccountMutexes(): void {
+  // No-op - kept for backward compatibility
 }
 
 export interface DeltaResult {
@@ -48,31 +42,40 @@ export function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult
     return { delta: '', matchedContent: oldStr };
   }
 
-  // Heuristic to detect if newStr is cumulative or incremental:
-  // If newStr is cumulative, it should share a common prefix with oldStr.
-  // Limit scan window to avoid O(n) on very long cumulative content
+  // Fast path: incremental SSE streams append to oldStr most of the time
+  if (newStr.startsWith(oldStr)) {
+    const delta = newStr.slice(oldStr.length);
+    if (delta.length <= 4 && oldStr.length > 2000) {
+      return { delta: newStr, matchedContent: oldStr + newStr };
+    }
+    return { delta, matchedContent: newStr };
+  }
+
+  // Fallback: segment-based prefix matching
   const scanWindow = Math.min(2000, oldStr.length);
-  let commonPrefixLen = 0;
   const maxLen = Math.min(scanWindow, newStr.length);
+
+  let commonPrefixLen = 0;
+  const segmentLen = 64;
+  while (commonPrefixLen + segmentLen <= maxLen) {
+    if (oldStr.slice(commonPrefixLen, commonPrefixLen + segmentLen) !==
+        newStr.slice(commonPrefixLen, commonPrefixLen + segmentLen)) {
+      break;
+    }
+    commonPrefixLen += segmentLen;
+  }
+
+  // Fine-grained scan within the mismatching segment
   while (commonPrefixLen < maxLen && oldStr[commonPrefixLen] === newStr[commonPrefixLen]) {
     commonPrefixLen++;
   }
 
   const threshold = Math.min(scanWindow, 4);
   if (commonPrefixLen >= threshold) {
-    return {
-      delta: newStr.substring(commonPrefixLen),
-      matchedContent: newStr
-    };
+    return { delta: newStr.substring(commonPrefixLen), matchedContent: newStr };
   }
 
-  // If the prefix check fails, we treat it as strictly incremental (or pure delta).
-  // We avoid fallback search/sliding overlap checks which cause disastrous false-positive
-  // corruptions on incremental streams with repetitive code/words (like "import {", "const", etc.).
-  return {
-    delta: newStr,
-    matchedContent: oldStr + newStr
-  };
+  return { delta: newStr, matchedContent: oldStr + newStr };
 }
 
 function parseQwenErrorPayload(raw: string): { message: string; status: number } | null {
@@ -215,7 +218,6 @@ export async function chatCompletions(c: Context) {
 
     let stream: ReadableStream | undefined;
     let uiSessionId = '';
-    let releaseChatLock: (() => void) | undefined;
     const completionId = 'chatcmpl-' + uuidv4();
 
     while (account) {
@@ -237,23 +239,19 @@ export async function chatCompletions(c: Context) {
 
       console.log(`[Chat] Routing request to account: ${accountEmail} (${accountId})`);
 
-    const accountMutex = getAccountMutex(accountId);
-    releaseChatLock = await accountMutex.acquire();
+      let retries = 3;
+      let retryDelay = 500;
+      let success = false;
 
-    try {
-        let retries = 3;
-        let retryDelay = 500;
-        let success = false;
-
-        while (retries > 0) {
-          try {
-            const result = await createQwenStream(
-              finalPrompt,
-              isThinkingModel,
-              body.model,
-              isNewSession ? null : undefined,
-              accountId === 'global' ? undefined : accountId
-            );
+      while (retries > 0) {
+        try {
+          const result = await createQwenStream(
+            finalPrompt,
+            isThinkingModel,
+            body.model,
+            null, // Always force new chat for concurrency isolation
+            accountId === 'global' ? undefined : accountId
+          );
             stream = result.stream;
             uiSessionId = result.uiSessionId;
             registerStream(completionId, {
@@ -265,61 +263,47 @@ export async function chatCompletions(c: Context) {
             });
             success = true;
             break;
-          } catch (err: any) {
-            retries--;
+        } catch (err: any) {
+          retries--;
 
-            if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-              const hourHint = err.message?.match(/Wait about (\d+) hour/);
-              const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
-              markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
-              console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Marked for cooldown.`);
-              releaseChatLock();
-              releaseChatLock = undefined;
-              lastError = err;
-              break;
-            }
-
-            if (retries === 0) {
-              if (err.upstreamStatus && err.upstreamStatus >= 500) {
-                markAccountRateLimited(accountId, undefined, 'ServerError');
-                console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
-              }
-              releaseChatLock();
-              releaseChatLock = undefined;
-              lastError = err;
-              break;
-            }
-
-            let useDelay = retryDelay;
-            if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
-              useDelay = err.retryAfterMs;
-            }
-            const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
-            if (!isRetryable) {
-              releaseChatLock();
-              releaseChatLock = undefined;
-              lastError = err;
-              break;
-            }
-            console.warn(`[Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left)`);
-            await new Promise(r => setTimeout(r, useDelay));
-            retryDelay = Math.min(retryDelay * 2, 5000);
+          if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
+            const hourHint = err.message?.match(/Wait about (\d+) hour/);
+            const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+            markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
+            console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Marked for cooldown.`);
+            lastError = err;
+            break;
           }
-        }
 
-        if (success) {
-          break;
-        }
+          if (retries === 0) {
+            if (err.upstreamStatus && err.upstreamStatus >= 500) {
+              markAccountRateLimited(accountId, undefined, 'ServerError');
+              console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
+            }
+            lastError = err;
+            break;
+          }
 
-        releaseChatLock = undefined;
-        account = getNextAvailableAccount(accountId);
-        continue;
-      } catch (err: any) {
-        releaseChatLock?.();
-        releaseChatLock = undefined;
-        lastError = err;
-        account = getNextAvailableAccount(accountId);
+          let useDelay = retryDelay;
+          if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
+            useDelay = err.retryAfterMs;
+          }
+          const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+          if (!isRetryable) {
+            lastError = err;
+            break;
+          }
+          console.warn(`[Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left)`);
+          await new Promise(r => setTimeout(r, useDelay));
+          retryDelay = Math.min(retryDelay * 2, 5000);
+        }
       }
+
+      if (success) {
+        break;
+      }
+
+      account = getNextAvailableAccount(accountId);
     }
 
     if (!stream) {
@@ -331,15 +315,27 @@ export async function chatCompletions(c: Context) {
       const reader = stream!.getReader();
       const decoder = new TextDecoder();
 
-      let currentThoughtIndex = 0;
-      let reasoningBuffer = '';
-      let lastFullContent = '';
-      let targetResponseId: string | null = null;
-      const toolParser = new StreamingToolParser(bodyAny.tools || []);
       const toolCallsOut: any[] = [];
       let buffer = '';
-      let completionTokens = 0;
-      let promptTokens = Math.ceil(finalPrompt.length / 3.5);
+      const hasTools = Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0;
+
+      const qwenParser = new QwenStreamParser(uiSessionId, {
+        tools: hasTools ? bodyAny.tools : [],
+        onThinking: (content: string) => {
+          // Accumulate reasoning content (handled via parser state)
+        },
+        onToolCall: (tc) => {
+          toolCallsOut.push({
+            id: tc.id,
+            type: 'function',
+            function: {
+              name: tc.name,
+              arguments: JSON.stringify(tc.arguments)
+            }
+          });
+        },
+      });
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -355,95 +351,21 @@ export async function chatCompletions(c: Context) {
           const dataStr = trimmed.slice(6);
           if (dataStr === '[DONE]') continue;
 
-          try {
-            const chunk = JSON.parse(dataStr);
-
-            if (chunk['response.created'] && chunk['response.created'].response_id) {
-              if (!targetResponseId) {
-                targetResponseId = chunk['response.created'].response_id;
-              }
-              updateSessionParent(uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id && !targetResponseId) {
-              targetResponseId = chunk.response_id;
-              updateSessionParent(uiSessionId, chunk.response_id);
-            }
-
-            if (chunk.usage) {
-              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
-            }
-
-            let vStr = '';
-            let foundStr = false;
-            let isThinkingChunk = false;
-
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && 
-                (targetResponseId === null || chunk.response_id === targetResponseId)) {
-              const delta = chunk.choices[0].delta;
-
-              if (delta.phase === 'thinking_summary') {
-                isThinkingChunk = true;
-                if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
-                  const thoughts = delta.extra.summary_thought.content;
-                  if (thoughts.length > currentThoughtIndex) {
-                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
-                    currentThoughtIndex = thoughts.length;
-                    foundStr = true;
-                  }
-                }
-              } else if (delta.phase === 'answer') {
-                isThinkingChunk = false;
-                if (delta.content !== undefined) {
-                  const newContent = delta.content || '';
-                  const result = getIncrementalDelta(lastFullContent, newContent);
-                  vStr = result.delta;
-                  if (vStr) {
-                    lastFullContent = result.matchedContent;
-                    foundStr = true;
-                  }
-                }
-              }
-            }
-
-            if (foundStr && vStr !== '') {
-              if (vStr === 'FINISHED') continue;
-              if (isThinkingChunk) {
-                reasoningBuffer += vStr;
-              } else {
-                const { text, toolCalls } = toolParser.feed(vStr);
-                // text is the lead-in before any tool_call tag.
-                // We skip emitting it here because OpenAI-compatible clients
-                // expect a structured tool_calls message when the assistant
-                // invokes tools. The lead-in is preserved in the parser and
-                // will be recovered only if the tool call fails to parse.
-                for (const tc of toolCalls) {
-                  toolCallsOut.push({
-                    id: tc.id,
-                    type: 'function',
-                    function: {
-                      name: tc.name,
-                      arguments: JSON.stringify(tc.arguments)
-                    }
-                  });
-                }
-              }
-            }
-          } catch (e) {
-            // parse error, ignore partial chunk
-          }
+          qwenParser.parseLine(dataStr);
         }
       }
 
       const upstreamError = parseQwenErrorPayload(buffer);
       if (upstreamError) {
         removeStream(completionId);
-        releaseChatLock?.();
         return c.json({ error: { message: upstreamError.message } }, upstreamError.status as any);
       }
 
-      const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
+      const { text: remainingText, toolCalls: remainingToolCalls } = qwenParser.flush();
+      const parserState = qwenParser.state;
+      let finalContent = parserState.lastFullContent;
       if (remainingText) {
-        lastFullContent += remainingText;
+        finalContent += remainingText;
       }
       for (const tc of remainingToolCalls) {
         toolCallsOut.push({
@@ -457,18 +379,17 @@ export async function chatCompletions(c: Context) {
       }
 
       const usage = {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
+        prompt_tokens: parserState.promptTokens,
+        completion_tokens: parserState.completionTokens,
+        total_tokens: parserState.promptTokens + parserState.completionTokens,
         prompt_tokens_details: { cached_tokens: 0 }
       };
-      const message: any = { role: 'assistant', content: toolCallsOut.length ? null : lastFullContent };
-      if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
+      const message: any = { role: 'assistant', content: toolCallsOut.length ? null : finalContent };
+      if (parserState.reasoningBuffer) message.reasoning_content = parserState.reasoningBuffer;
       if (toolCallsOut.length) toolCallsOut.forEach((tc, idx) => tc.index = idx);
       if (toolCallsOut.length) message.tool_calls = toolCallsOut;
 
       removeStream(completionId);
-      releaseChatLock?.();
       return c.json({
         id: completionId,
         object: 'chat.completion',
@@ -491,264 +412,293 @@ export async function chatCompletions(c: Context) {
     return honoStream(c, async (streamWriter: any) => {
       let heartbeatInterval: any;
       try {
-      // Send heartbeat to prevent Cloudflare 524 timeout
-      await streamWriter.write(': heartbeat\n\n');
+        // Send heartbeat to prevent Cloudflare 524 timeout
+        await streamWriter.write(': heartbeat\n\n');
 
-      // Set up a periodic heartbeat to keep the connection alive during long thinking phases
-      heartbeatInterval = setInterval(async () => {
-        try {
-          await streamWriter.write(': keep-alive\n\n');
-        } catch (e) {
-          clearInterval(heartbeatInterval);
-        }
-      }, 15000); // Every 15 seconds
-
-      const writeEvent = async (data: any) => {
-        await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
-      };
-
-      const makeChoice = (delta: any, finishReason: string | null = null) => ({
-        index: 0,
-        delta,
-        logprobs: null,
-        finish_reason: finishReason
-      });
-
-      // Send initial chunk
-      await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [makeChoice({ role: 'assistant', content: '' })]
-      });
-
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      
-      let inThinkingState = false;
-      let thinkingFragments: Record<string, boolean> = {};
-      let currentThoughtIndex = 0;
-      let currentAppendPath = '';
-      
-       let reasoningBuffer = '';
-       let lastFullContent = '';
-       let targetResponseId: string | null = null;
-       const toolParser = new StreamingToolParser(bodyAny.tools || []);
-
-      let buffer = '';
-      let completionTokens = 0;
-      let promptTokens = Math.ceil(finalPrompt.length / 3.5);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          
-          const dataStr = trimmed.slice(6);
-          if (dataStr === '[DONE]') {
-            await streamWriter.write('data: [DONE]\n\n');
-            continue;
-          }
-
+        // Set up a periodic heartbeat to keep the connection alive during long thinking phases
+        heartbeatInterval = setInterval(async () => {
           try {
-            const chunk = JSON.parse(dataStr);
-
-            // Extract response_id for session tracking and target filtering
-            if (chunk['response.created'] && chunk['response.created'].response_id) {
-              if (!targetResponseId) {
-                targetResponseId = chunk['response.created'].response_id;
-              }
-              updateSessionParent(uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id && !targetResponseId) {
-              targetResponseId = chunk.response_id;
-              updateSessionParent(uiSessionId, chunk.response_id);
-            }
-
-            if (chunk.usage) {
-              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
-            }
-
-            let vStr = '';
-            let foundStr = false;
-            let isThinkingChunk = false;
-
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && 
-                (targetResponseId === null || chunk.response_id === targetResponseId)) {
-              const delta = chunk.choices[0].delta;
-              
-              if (delta.phase === 'thinking_summary') {
-                isThinkingChunk = true;
-                if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
-                  const thoughts = delta.extra.summary_thought.content;
-                  if (thoughts.length > currentThoughtIndex) {
-                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
-                    currentThoughtIndex = thoughts.length;
-                    foundStr = true;
-                  }
-                }
-              } else if (delta.phase === 'answer') {
-                isThinkingChunk = false;
-                if (delta.content !== undefined) {
-                  const newContent = delta.content || '';
-                  const result = getIncrementalDelta(lastFullContent, newContent);
-                  vStr = result.delta;
-                  if (vStr) {
-                    lastFullContent = result.matchedContent;
-                    foundStr = true;
-                  }
-                }
-              }
-            }
-
-            if (foundStr && vStr !== '') {
-              if (vStr === 'FINISHED') continue;
-
-              if (isThinkingChunk) {
-                inThinkingState = true;
-                reasoningBuffer += vStr;
-                await writeEvent({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: body.model,
-                  choices: [makeChoice({ reasoning_content: vStr })]
-                });
-              } else {
-                inThinkingState = false;
-                const { text, toolCalls } = toolParser.feed(vStr);
-
-                if (text) {
-                  await writeEvent({
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: body.model,
-                    choices: [makeChoice({ content: text })]
-                  });
-                }
-
-                for (const tc of toolCalls) {
-                  await writeEvent({
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: body.model,
-                    choices: [makeChoice({
-                      tool_calls: [{
-                        index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
-                        id: tc.id,
-                        type: 'function',
-                        function: {
-                          name: tc.name,
-                          arguments: JSON.stringify(tc.arguments)
-                        }
-                      }]
-                    })]
-                  });
-                }
-              }
-            }
+            await streamWriter.write(': keep-alive\n\n');
           } catch (e) {
-            // parse error, ignore partial chunk
+            clearInterval(heartbeatInterval);
+          }
+        }, 15000); // Every 15 seconds
+
+        // Optimized: fire-and-forget write (Hono's streamWriter has internal buffering)
+        const writeEvent = (data: any) => {
+          streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
+        };
+
+        const makeChoice = (delta: any, finishReason: string | null = null) => ({
+          index: 0,
+          delta,
+          logprobs: null,
+          finish_reason: finishReason
+        });
+
+        // Pre-compute timestamp once before the stream loop
+        const createdTimestamp = Math.floor(Date.now() / 1000);
+
+        // Send initial chunk
+        writeEvent({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created: createdTimestamp,
+          model: body.model,
+          choices: [makeChoice({ role: 'assistant', content: '' })]
+        });
+
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+
+        let reasoningBuffer = '';
+        let lastFullContent = '';
+        let targetResponseId: string | null = null;
+        let targetResponseIdSet = false;
+        let currentThoughtIndex = 0;
+        const hasTools = Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0;
+        const toolParser = hasTools ? new StreamingToolParser(bodyAny.tools) : null;
+
+        let buffer = '';
+        let completionTokens = 0;
+        let promptTokens = Math.ceil(finalPrompt.length / 3.5);
+
+        // Real-time flush: send each event immediately to minimize latency
+        let chunkCount = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+           let startIdx = 0;
+           let newlineIdx: number;
+           while ((newlineIdx = buffer.indexOf('\n', startIdx)) !== -1) {
+             const line = buffer.slice(startIdx, newlineIdx);
+             startIdx = newlineIdx + 1;
+
+             const trimmed = line.trim();
+             if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
+             const dataStr = trimmed.slice(6);
+             if (dataStr === '[DONE]') {
+               streamWriter.write('data: [DONE]\n\n');
+               continue;
+             }
+
+            try {
+              const chunk = JSON.parse(dataStr);
+
+              // Extract response_id for session tracking and target filtering
+              if (chunk['response.created'] && chunk['response.created'].response_id) {
+                if (!targetResponseId) {
+                  targetResponseId = chunk['response.created'].response_id;
+                  targetResponseIdSet = true;
+                }
+                updateSessionParent(uiSessionId, chunk['response.created'].response_id);
+              } else if (chunk.response_id && !targetResponseIdSet) {
+                targetResponseId = chunk.response_id;
+                targetResponseIdSet = true;
+                updateSessionParent(uiSessionId, chunk.response_id);
+              }
+
+              if (chunk.usage) {
+                if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
+                if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
+              }
+
+              let vStr = '';
+              let foundStr = false;
+              let isThinkingChunk = false;
+
+              if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
+                  (!targetResponseIdSet || chunk.response_id === targetResponseId)) {
+                const delta = chunk.choices[0].delta;
+
+                if (delta.phase === 'thinking_summary') {
+                  isThinkingChunk = true;
+                  if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
+                    const thoughts = delta.extra.summary_thought.content;
+                    if (thoughts.length > currentThoughtIndex) {
+                      vStr = thoughts.slice(currentThoughtIndex).join('\n');
+                      currentThoughtIndex = thoughts.length;
+                      foundStr = true;
+                    }
+                  }
+                } else if (delta.phase === 'answer') {
+                  isThinkingChunk = false;
+                  if (delta.content !== undefined) {
+                    const newContent = delta.content || '';
+                    const result = getIncrementalDelta(lastFullContent, newContent);
+                    vStr = result.delta;
+                    if (vStr) {
+                      lastFullContent = result.matchedContent;
+                      foundStr = true;
+                    }
+                  }
+                }
+              }
+
+              if (foundStr && vStr !== '') {
+        if (vStr === 'FINISHED') continue;
+
+                if (isThinkingChunk) {
+                  reasoningBuffer += vStr;
+                  streamWriter.write(`data: ${JSON.stringify({
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created: createdTimestamp,
+                    model: body.model,
+                    choices: [makeChoice({ reasoning_content: vStr })]
+                  })}\n\n`);
+                } else {
+                  if (hasTools && toolParser) {
+                    const { text, toolCalls } = toolParser.feed(vStr);
+                    if (text) {
+                      streamWriter.write(`data: ${JSON.stringify({
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: createdTimestamp,
+                        model: body.model,
+                        choices: [makeChoice({ content: text })]
+                      })}\n\n`);
+                    }
+                    for (const tc of toolCalls) {
+                      streamWriter.write(`data: ${JSON.stringify({
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: createdTimestamp,
+                        model: body.model,
+                        choices: [makeChoice({
+                          tool_calls: [{
+                            index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
+                            id: tc.id,
+                            type: 'function',
+                            function: {
+                              name: tc.name,
+                              arguments: JSON.stringify(tc.arguments)
+                            }
+                          }]
+                        })]
+                      })}\n\n`);
+                    }
+                  } else {
+                    if (vStr) {
+                      streamWriter.write(`data: ${JSON.stringify({
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: createdTimestamp,
+                        model: body.model,
+                        choices: [makeChoice({ content: vStr })]
+                      })}\n\n`);
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // parse error, ignore partial chunk
+            }
+          }
+
+          // Trim processed portion from buffer
+          if (startIdx > 0) {
+            buffer = buffer.slice(startIdx);
+          }
+
+          // Periodic yielding to prevent event loop starvation
+          chunkCount++;
+          if (chunkCount % 50 === 0) {
+            await new Promise(r => setImmediate(r));
           }
         }
-      }
 
-      const upstreamError = parseQwenErrorPayload(buffer);
-      if (upstreamError) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({ content: upstreamError.message })]
-        });
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({}, 'stop')]
-        });
-        await streamWriter.write('data: [DONE]\n\n');
-        return;
-      }
+        const upstreamError = parseQwenErrorPayload(buffer);
+        if (upstreamError) {
+          writeEvent({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({ content: upstreamError.message })]
+          });
+          writeEvent({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({}, 'stop')]
+          });
+          streamWriter.write('data: [DONE]\n\n');
+          return;
+        }
 
-      // Flush tool parser
-      const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
-      if (remainingText) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({ content: remainingText })]
-        });
-      }
-      for (const tc of remainingToolCalls) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({
-            tool_calls: [{
-              index: toolParser.getEmittedToolCallCount() - remainingToolCalls.length + remainingToolCalls.indexOf(tc),
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.name,
-                arguments: JSON.stringify(tc.arguments)
-              }
-            }]
-          })]
-        });
-      }
-  
-      // Send finish reason
-      const usage = {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-        prompt_tokens_details: { cached_tokens: 0 }
-      };
-  
-      const finalFinishReason = toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
-  
-      await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [makeChoice({}, finalFinishReason)],
-        ...(body.stream_options?.include_usage ? {} : { usage })
-      });
+        if (toolParser) {
+          const flushResult = toolParser.flush();
 
-      if (body.stream_options?.include_usage) {
-        await writeEvent({
+          if (flushResult.text) {
+            writeEvent({
+              id: completionId,
+              object: 'chat.completion.chunk',
+              created: createdTimestamp,
+              model: body.model,
+              choices: [makeChoice({ content: flushResult.text })]
+            });
+          }
+          for (const tc of flushResult.toolCalls) {
+            const idx = toolParser.getEmittedToolCallCount() - flushResult.toolCalls.length + flushResult.toolCalls.indexOf(tc);
+            writeEvent({
+              id: completionId,
+              object: 'chat.completion.chunk',
+              created: createdTimestamp,
+              model: body.model,
+              choices: [makeChoice({
+                tool_calls: [{
+                  index: idx,
+                  id: tc.id,
+                  type: 'function',
+                  function: {
+                    name: tc.name,
+                    arguments: JSON.stringify(tc.arguments)
+                  }
+                }]
+              })]
+            });
+          }
+        }
+
+        const usage = {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          prompt_tokens_details: { cached_tokens: 0 }
+        };
+
+        const finalFinishReason = toolParser && toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
+
+        writeEvent({
           id: completionId,
           object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
+          created: createdTimestamp,
           model: body.model,
-          choices: [],
-          usage
+          choices: [makeChoice({}, finalFinishReason)],
+          ...(body.stream_options?.include_usage ? {} : { usage })
         });
-      }
-      await streamWriter.write('data: [DONE]\n\n');
+
+        if (body.stream_options?.include_usage) {
+          writeEvent({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: createdTimestamp,
+            model: body.model,
+            choices: [],
+            usage
+          });
+        }
+        streamWriter.write('data: [DONE]\n\n');
 
       } finally {
         clearInterval(heartbeatInterval);
         removeStream(completionId);
-        releaseChatLock?.();
       }
     });
   } catch (err: any) {

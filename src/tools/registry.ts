@@ -11,7 +11,7 @@ import type {
   ToolHandler,
   ToolRegistration,
 } from './types';
-import { validateAgainstSchema, SchemaValidationError } from './schema';
+import { validateAgainstSchema } from './schema';
 
 /**
  * Central tool registry. Tools are registered at startup and looked up by name

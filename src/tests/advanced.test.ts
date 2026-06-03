@@ -3,23 +3,21 @@ import assert from 'node:assert';
 
 process.env.TEST_MOCK_PLAYWRIGHT = 'true';
 
-import { app } from '../api/server.js';
-
 delete process.env.API_KEY;
 
-// Helper to mock the fetch global for testing empty response retry and caching logic
+import { app } from '../api/server.js';
+
 function setupFetchMock(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const urlStr = typeof input === 'string' ? input : ('url' in input ? input.url : String(input));
     if (urlStr.includes('chat.qwen.ai')) {
-      // Handle models list request separately if handler doesn't
       if (urlStr.includes('/api/models')) {
          return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
       }
       return handler(urlStr, init);
     }
-    return originalFetch(input, init);
+    return originalFetch(input);
   };
   return () => { globalThis.fetch = originalFetch; };
 }

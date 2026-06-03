@@ -8,9 +8,6 @@ import { app as modelsApp } from './models.js'
 import { chatCompletions, chatCompletionsStop } from '../routes/chat.js'
 
 const app = new Hono()
-app.route('', modelsApp)
-app.post('/v1/chat/completions', chatCompletions)
-app.post('/v1/chat/completions/stop', chatCompletionsStop)
 
 let cache: MemoryCache
 let watchdog: Watchdog
@@ -39,6 +36,10 @@ app.use('/v1/*', async (c, next) => {
   }
   await next()
 })
+
+app.route('', modelsApp)
+app.post('/v1/chat/completions', chatCompletions)
+app.post('/v1/chat/completions/stop', chatCompletionsStop)
 
 app.get('/health', async (c) => {
   const status = await watchdog?.getStatus()
@@ -72,19 +73,29 @@ export async function startServer(): Promise<void> {
   const { loadAccounts } = await import('../core/accounts.ts')
   const accounts = loadAccounts()
 
+  const { initPlaywright, initPlaywrightForAccount, getQwenHeaders } = await import('../services/playwright.ts')
+  
+  await initPlaywright(config.browser.headless)
+  
   if (accounts.length > 0) {
-    console.log(`[Server] Pre-warming ${accounts.length} configured account(s)...`)
-    const { initPlaywrightForAccount } = await import('../services/playwright.ts')
-    for (const account of accounts) {
-      try {
-        await initPlaywrightForAccount(account, config.browser.headless)
-      } catch (err: any) {
-        console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
-      }
-    }
-  } else {
-    const { initPlaywright } = await import('../services/playwright.ts')
-    await initPlaywright(config.browser.headless)
+    console.log(`[Server] Pre-warming ${accounts.length} configured account(s) in parallel...`)
+    // Parallelize account initialization using Promise.all
+    await Promise.all(
+      accounts.map(account =>
+        initPlaywrightForAccount(account, config.browser.headless).catch((err: any) => {
+          console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
+        })
+      )
+    )
+    console.log('[Server] Pre-fetching headers for all accounts in background...')
+    // Parallel header pre-fetching (no global context)
+    await Promise.all(
+      accounts.map(account =>
+        getQwenHeaders(false, account.id).catch(err => {
+          console.error(`[Server] Background header pre-fetch failed for ${account.email}:`, err.message)
+        })
+      )
+    )
   }
 
   watchdog = new Watchdog()
@@ -107,6 +118,8 @@ export async function startServer(): Promise<void> {
     await cache.close()
     const { closePlaywright } = await import('../services/playwright.js')
     await closePlaywright()
+    const { cleanupAllAccountMutexes } = await import('../routes/chat.js')
+    cleanupAllAccountMutexes()
     const { closeDatabase } = await import('../core/database.ts')
     closeDatabase()
     server?.close()

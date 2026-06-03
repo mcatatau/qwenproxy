@@ -187,10 +187,7 @@ export class StreamingToolParser {
         if (match && match.index !== undefined) {
           // Text before the tool call tag
           const textBefore = this.buffer.substring(0, match.index);
-          // Once a tool call appears, hold the lead-in text.
-          // OpenAI-compatible clients expect the whole assistant turn to be
-          // a structured tool_calls message when tools are invoked.
-          this.pendingLeadIn += textBefore;
+          result.text += textBefore;
           this.insideTool = true;
           this.currentOpenTag = match[0];
           this.buffer = this.buffer.substring(match.index + match[0].length);
@@ -219,6 +216,20 @@ export class StreamingToolParser {
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
+          if (this.buffer.length > 0) {
+            const nextMatch = this.buffer.match(TOOL_OPEN_RE);
+              if (nextMatch && nextMatch.index !== undefined) {
+              result.text += this.buffer.substring(0, nextMatch.index);
+              this.insideTool = true;
+              this.currentOpenTag = nextMatch[0];
+              this.buffer = this.buffer.substring(nextMatch.index + nextMatch[0].length);
+            } else {
+              const partialIdx = findPartialToolOpenIndex(this.buffer);
+              const flushIdx = partialIdx === -1 ? this.buffer.length : partialIdx;
+              result.text += this.buffer.substring(0, flushIdx);
+              this.buffer = this.buffer.substring(flushIdx);
+            }
+          }
         } else {
           break; // Wait for more data
         }
@@ -233,33 +244,22 @@ export class StreamingToolParser {
     if (!this.buffer && !this.pendingLeadIn) return result;
 
     if (this.insideTool) {
-      // Stream ended with unclosed <tool_call>. Try to recover.
       const trimmed = this.buffer.trim();
       if (trimmed.length > 0) {
         const recovered = this.tryRecoverToolCall(trimmed);
         if (recovered) {
           result.toolCalls.push(recovered);
           this.emittedToolCallCount++;
-          this.pendingLeadIn = '';
         } else {
-          // Recovery failed. Restore lead-in text if no tools were emitted.
           logger.warn('[parser] Dropping unrecoverable unclosed tool call at end of stream');
-          if (this.emittedToolCallCount === 0 && this.pendingLeadIn.trim().length > 0) {
-            result.text += this.pendingLeadIn;
-          }
-          this.pendingLeadIn = '';
+          result.text += this.pendingLeadIn;
+          result.text += this.currentOpenTag + this.buffer + TOOL_END;
         }
       } else {
-        // Empty tool call block - restore lead-in
-        if (this.emittedToolCallCount === 0 && this.pendingLeadIn.trim().length > 0) {
-          result.text += this.pendingLeadIn;
-        }
-        this.pendingLeadIn = '';
+        result.text += this.pendingLeadIn;
       }
     } else {
-      if (this.emittedToolCallCount === 0) {
-        result.text += this.buffer;
-      }
+      result.text += this.buffer;
     }
 
     this.buffer = '';
@@ -331,10 +331,9 @@ export class StreamingToolParser {
 
     // 3) Try JSON object format (single or multiple)
     if (t.startsWith('{') || t.includes('"name"')) {
-      const tcs = this.parseToolContent(t);
-      if (tcs.length > 0) {
-        for (const tc of tcs) {
-          // Check for tool name from opening tag attribute
+      const calls = this.parseToolContent(t);
+      if (calls.length > 0) {
+        for (const tc of calls) {
           if (!tc.name || tc.name === '') {
             const attrName = extractToolName(this.currentOpenTag, t);
             if (attrName) tc.name = attrName;
@@ -350,17 +349,14 @@ export class StreamingToolParser {
     }
 
     // 4) Tool call is malformed and unrecoverable.
-    // Never leak internal XML to user-visible content.
-    // Restore lead-in text if no tools were emitted.
     logger.warn('[parser] Dropping malformed tool call block', { 
       contentPreview: t.substring(0, 500), 
       hasName: t.includes('"name"') || t.includes('"tool"') || t.includes('tool_name'),
       hasArgs: t.includes('"arguments"') || t.includes('"args"') || t.includes('"parameters"') || t.includes('"input"'),
       first100Chars: t.substring(0, 100)
     });
-    if (this.emittedToolCallCount === 0 && this.pendingLeadIn.trim().length > 0) {
-      result.text += this.pendingLeadIn;
-    }
+    result.text += this.pendingLeadIn;
+    result.text += this.currentOpenTag + content + TOOL_END;
     this.pendingLeadIn = '';
   }
 

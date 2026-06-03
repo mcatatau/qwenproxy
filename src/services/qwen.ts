@@ -101,7 +101,7 @@ export interface QwenPayload {
   stream: boolean;
   version: string;
   incremental_output: boolean;
-  chat_id: string | null;
+  chat_id: string;
   chat_mode: string;
   model: string;
   parent_id: string | null;
@@ -228,34 +228,31 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
 }
 
 export async function createQwenStream(
-  prompt: string, 
-  enableThinking: boolean, 
+  prompt: string,
+  enableThinking: boolean,
   modelId: string,
   forcedParentId?: string | null,
   accountId?: string
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, controller: AbortController, accountId: string }> {
-  const { headers, chatSessionId, parentMessageId } = await getQwenHeaders(forcedParentId === null, accountId);
+  const { headers, chatSessionId } = await getQwenHeaders(true, accountId);
 
-  let actualParentId: string | null = parentMessageId;
-  
-  if (forcedParentId !== undefined) {
-    actualParentId = forcedParentId;
-  } else if (chatSessionId) {
-    const storedParent = getSessionParent(chatSessionId);
-    if (storedParent !== undefined) {
-      actualParentId = storedParent;
-    }
+  if (!chatSessionId) {
+    throw new Error('Playwright did not return a valid chatSessionId. A sua sessão no Qwen pode ter expirado. Faça login novamente no navegador do Playwright.');
   }
+
+  const actualParentId: string | null = null;
 
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
   const model = modelId.replace('-no-thinking', '');
 
+  const chatId = chatSessionId;
+
   const payload: QwenPayload = {
     stream: true,
     version: '2.1',
     incremental_output: true,
-    chat_id: chatSessionId || null,
+    chat_id: chatId,
     chat_mode: 'normal',
     model: model,
     parent_id: actualParentId,
@@ -292,9 +289,7 @@ export async function createQwenStream(
     timestamp: timestamp + 1
   };
 
-  const url = chatSessionId 
-    ? `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatSessionId}`
-    : 'https://chat.qwen.ai/api/v2/chat/completions';
+  const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 120000);
@@ -306,7 +301,7 @@ export async function createQwenStream(
       'content-type': 'application/json',
       'cookie': headers['cookie'],
       'origin': 'https://chat.qwen.ai',
-      'referer': chatSessionId ? `https://chat.qwen.ai/c/${chatSessionId}` : 'https://chat.qwen.ai/',
+      'referer': 'https://chat.qwen.ai/',
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
@@ -373,5 +368,7 @@ export async function createQwenStream(
     throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
   }
 
-  return { stream: response.body, headers, uiSessionId: chatSessionId, controller, accountId: accountId ?? 'global' };
+  // Extract chat_id from response headers if available, otherwise generate one
+  const responseChatId = response.headers.get('x-chat-id') || uuidv4();
+  return { stream: response.body, headers, uiSessionId: responseChatId, controller, accountId: accountId ?? 'global' };
 }

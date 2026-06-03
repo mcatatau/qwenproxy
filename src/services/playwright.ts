@@ -25,7 +25,7 @@ interface AccountHeaderCache {
   currentHeaders: Record<string, string>;
   cachedQwenHeaders: { headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null;
   lastHeadersTime: number;
-  refreshTimeout: NodeJS.Timeout | null;
+  refreshInProgress: boolean;
 }
 
 const accountHeaderCaches = new Map<string, AccountHeaderCache>();
@@ -37,14 +37,16 @@ function getAccountHeaderCache(accountId: string): AccountHeaderCache {
       currentHeaders: {},
       cachedQwenHeaders: null,
       lastHeadersTime: 0,
-      refreshTimeout: null,
+      refreshInProgress: false,
     };
     accountHeaderCaches.set(accountId, cache);
   }
   return cache;
 }
 
-const HEADERS_TTL = 30 * 60 * 1000;
+const HEADERS_TTL = 60 * 60 * 1000;
+const COOKIE_CACHE_TTL = 5 * 60 * 1000;
+const cookieCaches = new Map<string, { cookie: string, timestamp: number }>();
 const REFRESH_THRESHOLD = 0.7;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -75,14 +77,30 @@ export class Mutex {
   }
 }
 
-const uiMutex = new Mutex();
+const uiMutexes = new Map<string, Mutex>();
+function getUiMutex(accountId: string): Mutex {
+  let m = uiMutexes.get(accountId);
+  if (!m) {
+    m = new Mutex();
+    uiMutexes.set(accountId, m);
+  }
+  return m;
+}
 
 export async function getCookies(accountId?: string): Promise<string> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return 'token=mock';
+  const cacheKey = accountId || 'global';
+  const now = Date.now();
+  const cached = cookieCaches.get(cacheKey);
+  if (cached && (now - cached.timestamp) < COOKIE_CACHE_TTL) {
+    return cached.cookie;
+  }
   const page = accountId ? accountPages.get(accountId) : activePage;
   if (!page) return '';
   const cookies = await page.context().cookies();
-  return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  cookieCaches.set(cacheKey, { cookie: cookieStr, timestamp: now });
+  return cookieStr;
 }
 
 export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string }> {
@@ -214,10 +232,7 @@ async function attemptAutoLogin(): Promise<void> {
 export async function closePlaywright() {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
   for (const cache of accountHeaderCaches.values()) {
-    if (cache.refreshTimeout) {
-      clearTimeout(cache.refreshTimeout);
-      cache.refreshTimeout = null;
-    }
+    cache.refreshInProgress = false;
   }
   if (context) {
     await context.close();
@@ -318,13 +333,22 @@ export async function getQwenHeaders(forceNew = false, accountId?: string): Prom
   const cacheKey = accountId || 'global';
   const cache = getAccountHeaderCache(cacheKey);
 
-  if (!forceNew && cache.cachedQwenHeaders && (Date.now() - cache.lastHeadersTime < HEADERS_TTL * REFRESH_THRESHOLD)) {
-    return cache.cachedQwenHeaders;
+  if (!forceNew && cache.cachedQwenHeaders) {
+    const age = Date.now() - cache.lastHeadersTime;
+    if (age < HEADERS_TTL) {
+      if (age > HEADERS_TTL * REFRESH_THRESHOLD && !cache.refreshInProgress) {
+        cache.refreshInProgress = true;
+        getQwenHeaders(true, accountId).finally(() => {
+          cache.refreshInProgress = false;
+        });
+      }
+      return cache.cachedQwenHeaders;
+    }
   }
-  const release = await uiMutex.acquire();
+
+  const release = await getUiMutex(cacheKey).acquire();
   try {
     if (!forceNew && cache.cachedQwenHeaders && (Date.now() - cache.lastHeadersTime < HEADERS_TTL)) {
-      release();
       return cache.cachedQwenHeaders;
     }
     return await _getQwenHeadersInternal(forceNew, accountId);
@@ -333,33 +357,74 @@ export async function getQwenHeaders(forceNew = false, accountId?: string): Prom
   }
 }
 
+/**
+ * Lightweight cookie/cookie refresh via direct API call instead of full browser automation.
+ * This attempts to extract cookies from the page context without triggering route interception.
+ */
+async function tryLightweightCookieRefresh(accountId?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null } | null> {
+  const cacheKey = accountId || 'global';
+  const cache = getAccountHeaderCache(cacheKey);
+
+  const page = accountId ? accountPages.get(accountId) : activePage;
+  if (!page) return null;
+
+  try {
+    const cookies = await page.context().cookies();
+    const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    const userAgent = await page.evaluate(() => navigator.userAgent);
+
+    const now = Date.now();
+    cookieCaches.set(cacheKey, { cookie: cookieStr, timestamp: now });
+
+    if (cache.cachedQwenHeaders && cache.currentHeaders.cookie) {
+      const updatedHeaders = {
+        ...cache.cachedQwenHeaders.headers,
+        cookie: cookieStr,
+        'user-agent': userAgent,
+      };
+      cache.cachedQwenHeaders = {
+        ...cache.cachedQwenHeaders,
+        headers: updatedHeaders,
+      };
+      cache.lastHeadersTime = now;
+      cache.currentHeaders = {
+        ...cache.currentHeaders,
+        cookie: cookieStr,
+        'user-agent': userAgent,
+      };
+      return cache.cachedQwenHeaders;
+    }
+  } catch {
+    // Lightweight refresh failed, fall back to full interception
+  }
+
+  return null;
+}
+
 async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
   const cacheKey = accountId || 'global';
   const cache = getAccountHeaderCache(cacheKey);
 
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     const mockSessionId = process.env.TEST_SESSION_ID || 'mock-session';
-    return { 
-      headers: { 
-        'authorization': 'Bearer MOCK', 
-        'cookie': 'token=mock', 
+    return {
+      headers: {
+        'authorization': 'Bearer MOCK',
+        'cookie': 'token=mock',
         'user-agent': 'mock',
         'bx-v': '2.5.36'
-      }, 
-      chatSessionId: mockSessionId, 
-      parentMessageId: null 
+      },
+      chatSessionId: mockSessionId,
+      parentMessageId: null
     };
   }
 
-  if (!forceNew && cache.cachedQwenHeaders && (Date.now() - cache.lastHeadersTime < HEADERS_TTL)) {
-    const age = Date.now() - cache.lastHeadersTime;
-    if (age > HEADERS_TTL * REFRESH_THRESHOLD && !cache.refreshTimeout) {
-      cache.refreshTimeout = setTimeout(() => {
-        cache.refreshTimeout = null;
-        getQwenHeaders(true, accountId).catch(() => {});
-      }, HEADERS_TTL - age);
+  // If headers are cached and not forceNew, try lightweight cookie refresh first
+  if (!forceNew && cache.cachedQwenHeaders) {
+    const lightResult = await tryLightweightCookieRefresh(accountId);
+    if (lightResult) {
+      return lightResult;
     }
-    return cache.cachedQwenHeaders;
   }
 
   if (accountId && !accountPages.has(accountId)) {
@@ -389,7 +454,7 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     if (!accountId) {
       const email = process.env.QWEN_EMAIL;
       const password = process.env.QWEN_PASSWORD;
-      
+
       if (email && password) {
         console.log('[Playwright] Detected login page. Attempting automated login...');
         try {
@@ -440,7 +505,7 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     console.log(`[Playwright] Setting up route interception for ${cacheKey}...`);
     const routeHandler = async (route: any, request: any) => {
       clearTimeout(timeout);
-      
+
       const reqHeaders = request.headers();
       let uiSessionId = '';
       let uiParentMessageId: string | null = null;
@@ -478,15 +543,12 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
       cache.currentHeaders = extractedHeaders;
       cache.cachedQwenHeaders = { headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId };
       cache.lastHeadersTime = Date.now();
-      if (cache.refreshTimeout) {
-        clearTimeout(cache.refreshTimeout);
-        cache.refreshTimeout = null;
-      }
+      cache.refreshInProgress = false;
 
       import('./qwen.ts').then(m => m.disableNativeTools(accountId).catch(() => {}));
 
       await route.abort('aborted');
-      
+
       await page.unroute('**/api/v2/chat/completions*', routeHandler);
 
       resolve(cache.cachedQwenHeaders);
@@ -495,26 +557,26 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     page.route('**/api/v2/chat/completions*', routeHandler).then(async () => {
       console.log(`[Playwright] Triggering request for ${cacheKey}...`);
       const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-      
+
       await page.focus(inputSelector);
       await page.fill(inputSelector, '');
       await page.type(inputSelector, 'a', { delay: 100 });
       console.log(`[Playwright] Typed char for ${cacheKey}, waiting for UI to update...`);
       await sleep(2000);
-      
+
       const selectors = [
         '.message-input-right-button-send .send-button',
         '.chat-prompt-send-button',
         'button.send-button'
       ];
-      
+
       let clicked = false;
       for (const selector of selectors) {
         try {
           const btn = await page.$(selector);
           if (btn && await btn.isVisible()) {
             console.log(`[Playwright] Attempting click on: ${selector}`);
-            
+
             await page.evaluate((sel) => {
               const element = document.querySelector(sel) as HTMLElement;
               if (element) {
@@ -522,9 +584,9 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
                 element.click();
               }
             }, selector);
-            
+
             await btn.click({ force: true, delay: 50 }).catch(() => {});
-            
+
             clicked = true;
             break;
           }

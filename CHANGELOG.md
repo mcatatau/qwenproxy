@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.2.1...v1.2.2) (2026-06-05)
+
+
+### Performance Improvements
+
+* reduce per-chunk overhead in streaming hot path ([3fc85fa](https://github.com/pedrofariasx/qwenproxy/commit/3fc85fa697af782b4d260a6310b4a381aeb66a29))
+
 ## [1.2.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.2.0...v1.2.1) (2026-06-05)
 
 

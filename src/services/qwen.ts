@@ -1,5 +1,7 @@
 import { getQwenHeaders, getBasicHeaders } from './playwright.ts';
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
+
+const CACHED_TIMEZONE = new Date().toString().split(' (')[0];
 
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
@@ -82,7 +84,6 @@ function cleanupStalePool(accountId: string) {
 }
 
 async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, string>> {
-  const { getBasicHeaders } = await import('./playwright.ts');
   const { cookie, userAgent, bxV } = await getBasicHeaders(accountId);
   return {
     cookie,
@@ -104,7 +105,7 @@ async function createRealQwenChat(header: Record<string, string>): Promise<strin
       origin: 'https://chat.qwen.ai',
       referer: 'https://chat.qwen.ai/c/new-chat',
       'user-agent': header['user-agent'],
-      'x-request-id': uuidv4(),
+      'x-request-id': crypto.randomUUID(),
       'bx-v': header['bx-v'],
     },
     body: JSON.stringify({
@@ -131,18 +132,26 @@ async function refillPoolForAccount(accountId: string) {
   if (!pool) { pool = []; warmPool.set(accountId, pool); }
   cleanupStalePool(accountId);
   const need = Math.max(0, WARM_POOL_SIZE - pool.length);
-  
+  if (need === 0) return;
+
+  let headers: Record<string, string>;
+  try {
+    headers = await getBasicQwenHeaders(accountId === 'global' ? undefined : accountId);
+  } catch (err) {
+    console.error(`[WarmPool] header fetch failed for ${accountId}:`, (err as Error).message);
+    return;
+  }
+
   const creationPromises = Array.from({ length: need }, async () => {
     try {
-      const headers = await getBasicQwenHeaders(accountId === 'global' ? undefined : accountId);
       const chatId = await createRealQwenChat(headers);
       return { chatId, headers, accountId, timestamp: Date.now() };
     } catch (err) {
-      console.error(`[WarmPool] refill failed for ${accountId}:`, (err as Error).message);
+      console.error(`[WarmPool] chat creation failed for ${accountId}:`, (err as Error).message);
       return null;
     }
   });
-  
+
   const results = await Promise.all(creationPromises);
   for (const entry of results) {
     if (entry) pool.push(entry);
@@ -252,7 +261,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
         'origin': 'https://chat.qwen.ai',
         'referer': 'https://chat.qwen.ai/',
         'user-agent': headers['user-agent'],
-        'x-request-id': uuidv4(),
+        'x-request-id': crypto.randomUUID(),
         'bx-ua': headers['bx-ua'],
         'bx-umidtoken': headers['bx-umidtoken'],
         'bx-v': headers['bx-v']
@@ -291,9 +300,9 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
       'cookie': cookie,
       'referer': 'https://chat.qwen.ai/',
       'user-agent': userAgent,
-      'x-request-id': uuidv4(),
+      'x-request-id': crypto.randomUUID(),
       'bx-v': bxV,
-      'timezone': new Date().toString(),
+      'timezone': CACHED_TIMEZONE,
       'source': 'web'
     }
   });
@@ -397,7 +406,7 @@ export async function createQwenStream(
   }
 
   const timestamp = Math.floor(Date.now() / 1000);
-  const fid = uuidv4();
+  const fid = crypto.randomUUID();
   const model = modelId.replace('-no-thinking', '');
 
   const payload: QwenPayload = {
@@ -456,10 +465,10 @@ export async function createQwenStream(
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
-      'timezone': new Date().toString().split(' (')[0],
+      'timezone': CACHED_TIMEZONE,
       'user-agent': chatHeaders['user-agent'],
       'x-accel-buffering': 'no',
-      'x-request-id': uuidv4(),
+      'x-request-id': crypto.randomUUID(),
       'bx-v': chatHeaders['bx-v'],
     },
     body: JSON.stringify(payload),

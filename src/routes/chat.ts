@@ -10,7 +10,7 @@
 
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import { createQwenStream, updateSessionParent } from '../services/qwen.ts';
 import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
 import { registry } from '../tools/registry.ts';
@@ -28,26 +28,68 @@ import { metrics } from '../core/metrics.js'
 export interface DeltaResult {
   delta: string;
   matchedContent: string;
+  contentLength: number;
+  contentSuffix: string;
 }
 
-export function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
+export function getIncrementalDelta(oldStr: string, newStr: string, prevLength: number = 0, prevSuffix: string = ''): DeltaResult {
   if (!oldStr) {
-    return { delta: newStr, matchedContent: newStr };
+    return { 
+      delta: newStr, 
+      matchedContent: newStr,
+      contentLength: newStr.length,
+      contentSuffix: newStr.slice(-64)
+    };
   }
   if (newStr === oldStr) {
-    return { delta: '', matchedContent: oldStr };
+    return { delta: '', matchedContent: oldStr, contentLength: prevLength, contentSuffix: prevSuffix };
   }
 
-  // Fast path: incremental SSE streams append to oldStr most of the time
+  // Ultra-fast path: use length tracking to avoid O(n) startsWith on large strings
+  if (newStr.length > prevLength && prevLength > 0) {
+    const delta = newStr.slice(prevLength);
+    const checkLen = Math.min(64, prevLength);
+    const expectedSuffix = prevSuffix.slice(-checkLen);
+    const actualSuffix = newStr.slice(prevLength - checkLen, prevLength);
+    
+    if (expectedSuffix === actualSuffix) {
+      if (delta.length <= 4 && oldStr.length > 2000) {
+        return { 
+          delta: newStr, 
+          matchedContent: oldStr + newStr,
+          contentLength: newStr.length,
+          contentSuffix: newStr.slice(-64)
+        };
+      }
+      return { 
+        delta, 
+        matchedContent: newStr,
+        contentLength: newStr.length,
+        contentSuffix: newStr.slice(-64)
+      };
+    }
+  }
+
+  // Fallback: startsWith check for edge cases
   if (newStr.startsWith(oldStr)) {
     const delta = newStr.slice(oldStr.length);
     if (delta.length <= 4 && oldStr.length > 2000) {
-      return { delta: newStr, matchedContent: oldStr + newStr };
+      return { 
+        delta: newStr, 
+        matchedContent: oldStr + newStr,
+        contentLength: newStr.length,
+        contentSuffix: newStr.slice(-64)
+      };
     }
-    return { delta, matchedContent: newStr };
+    return { 
+      delta, 
+      matchedContent: newStr,
+      contentLength: newStr.length,
+      contentSuffix: newStr.slice(-64)
+    };
   }
 
-  // Fallback: segment-based prefix matching
+  // Segment-based prefix matching (rare path)
   const scanWindow = Math.min(2000, oldStr.length);
   const maxLen = Math.min(scanWindow, newStr.length);
 
@@ -61,17 +103,27 @@ export function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult
     commonPrefixLen += segmentLen;
   }
 
-  // Fine-grained scan within the mismatching segment
   while (commonPrefixLen < maxLen && oldStr[commonPrefixLen] === newStr[commonPrefixLen]) {
     commonPrefixLen++;
   }
 
   const threshold = Math.min(scanWindow, 4);
   if (commonPrefixLen >= threshold) {
-    return { delta: newStr.substring(commonPrefixLen), matchedContent: newStr };
+    return { 
+      delta: newStr.substring(commonPrefixLen), 
+      matchedContent: newStr,
+      contentLength: newStr.length,
+      contentSuffix: newStr.slice(-64)
+    };
   }
 
-  return { delta: newStr, matchedContent: oldStr + newStr };
+  const combined = oldStr + newStr;
+  return { 
+    delta: newStr, 
+    matchedContent: combined,
+    contentLength: combined.length,
+    contentSuffix: combined.slice(-64)
+  };
 }
 
 function parseQwenErrorPayload(raw: string): { message: string; status: number } | null {
@@ -115,29 +167,26 @@ export async function chatCompletions(c: Context) {
       const msg = messages[i];
       let contentStr = '';
       if (Array.isArray(msg.content)) {
-        // Handle multimodal content (text + images + videos + audio + files)
-        const multimodalParts = msg.content.filter(
-          (p: any) =>
+        // Single-pass: extract text and multimodal parts in one iteration
+        const textParts: string[] = [];
+        const multimodalParts: Array<{ type: string; text?: string; image_url?: { url: string }; video_url?: { url: string }; audio_url?: { url: string }; file_url?: { url: string } }> = [];
+        
+        for (const p of msg.content as any[]) {
+          if (p.type === "text" && p.text) {
+            textParts.push(p.text);
+          } else if (
             (p.type === "image_url" && p.image_url?.url) ||
             (p.type === "video_url" && p.video_url?.url) ||
             (p.type === "audio_url" && p.audio_url?.url) ||
-            (p.type === "file_url" && p.file_url?.url),
-        );
-
+            (p.type === "file_url" && p.file_url?.url)
+          ) {
+            multimodalParts.push(p);
+          }
+        }
+        
+        contentStr = textParts.join("\n");
         if (multimodalParts.length > 0) {
-          // Defer processing to after account selection to reuse cached headers
           pendingMultimodal.push(multimodalParts);
-          // Extract text parts for prompt building
-          contentStr = msg.content
-            .filter((p: any) => p.type === "text")
-            .map((p: any) => p.text)
-            .join("\n");
-        } else {
-          // No multimodal parts, just extract text
-          contentStr = msg.content
-            .filter((p: any) => p.type === "text")
-            .map((p: any) => p.text)
-            .join("\n");
         }
       } else if (typeof msg.content === 'object' && msg.content !== null) {
         contentStr = JSON.stringify(msg.content);
@@ -245,7 +294,7 @@ export async function chatCompletions(c: Context) {
 
     let stream: ReadableStream | undefined;
     let uiSessionId = '';
-    const completionId = 'chatcmpl-' + uuidv4();
+    const completionId = 'chatcmpl-' + crypto.randomUUID();
 
     while (account) {
       const accountId = account.id;
@@ -472,10 +521,30 @@ export async function chatCompletions(c: Context) {
           finish_reason: finishReason
         });
 
-        // Pre-compute timestamp once before the stream loop
         const createdTimestamp = Math.floor(Date.now() / 1000);
 
-        // Send initial chunk
+        const fastWriteContent = (content: string) => {
+          const chunk = JSON.stringify({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({ content })]
+          });
+          streamWriter.write(`data: ${chunk}\n\n`);
+        };
+
+        const fastWriteReasoning = (content: string) => {
+          const chunk = JSON.stringify({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({ reasoning_content: content })]
+          });
+          streamWriter.write(`data: ${chunk}\n\n`);
+        };
+
         writeEvent({
           id: completionId,
           object: 'chat.completion.chunk',
@@ -489,6 +558,8 @@ export async function chatCompletions(c: Context) {
 
         let reasoningBuffer = '';
         let lastFullContent = '';
+        let contentLength = 0;
+        let contentSuffix = '';
         let targetResponseId: string | null = null;
         let targetResponseIdSet = false;
         let currentThoughtIndex = 0;
@@ -496,27 +567,27 @@ export async function chatCompletions(c: Context) {
         const toolParser = hasTools ? new StreamingToolParser(bodyAny.tools) : null;
 
         let buffer = '';
+        let bufferOffset = 0;
         let completionTokens = 0;
         let promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
-        // Real-time flush: send each event immediately to minimize latency
-        let chunkCount = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
 
-           let startIdx = 0;
-           let newlineIdx: number;
-           while ((newlineIdx = buffer.indexOf('\n', startIdx)) !== -1) {
-             const line = buffer.slice(startIdx, newlineIdx);
-             startIdx = newlineIdx + 1;
+          while (bufferOffset < buffer.length) {
+            const newlineIdx = buffer.indexOf('\n', bufferOffset);
+            if (newlineIdx === -1) break;
+            
+            const line = buffer.slice(bufferOffset, newlineIdx);
+            bufferOffset = newlineIdx + 1;
 
-             const trimmed = line.trim();
-             if (!trimmed || !trimmed.startsWith('data: ')) continue;
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data: ')) continue;
 
-             const dataStr = trimmed.slice(6);
+            const dataStr = trimmed.slice(6);
              if (dataStr === '[DONE]') {
                streamWriter.write('data: [DONE]\n\n');
                continue;
@@ -565,10 +636,12 @@ export async function chatCompletions(c: Context) {
                   isThinkingChunk = false;
                   if (delta.content !== undefined) {
                     const newContent = delta.content || '';
-                    const result = getIncrementalDelta(lastFullContent, newContent);
+                    const result = getIncrementalDelta(lastFullContent, newContent, contentLength, contentSuffix);
                     vStr = result.delta;
                     if (vStr) {
                       lastFullContent = result.matchedContent;
+                      contentLength = result.contentLength;
+                      contentSuffix = result.contentSuffix;
                       foundStr = true;
                     }
                   }
@@ -580,24 +653,12 @@ export async function chatCompletions(c: Context) {
 
                 if (isThinkingChunk) {
                   reasoningBuffer += vStr;
-                  streamWriter.write(`data: ${JSON.stringify({
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: createdTimestamp,
-                    model: body.model,
-                    choices: [makeChoice({ reasoning_content: vStr })]
-                  })}\n\n`);
+                  fastWriteReasoning(vStr);
                 } else {
                   if (hasTools && toolParser) {
                     const { text, toolCalls } = toolParser.feed(vStr);
                     if (text) {
-                      streamWriter.write(`data: ${JSON.stringify({
-                        id: completionId,
-                        object: 'chat.completion.chunk',
-                        created: createdTimestamp,
-                        model: body.model,
-                        choices: [makeChoice({ content: text })]
-                      })}\n\n`);
+                      fastWriteContent(text);
                     }
                     for (const tc of toolCalls) {
                       streamWriter.write(`data: ${JSON.stringify({
@@ -620,13 +681,7 @@ export async function chatCompletions(c: Context) {
                     }
                   } else {
                     if (vStr) {
-                      streamWriter.write(`data: ${JSON.stringify({
-                        id: completionId,
-                        object: 'chat.completion.chunk',
-                        created: createdTimestamp,
-                        model: body.model,
-                        choices: [makeChoice({ content: vStr })]
-                      })}\n\n`);
+                      fastWriteContent(vStr);
                     }
                   }
                 }
@@ -636,16 +691,11 @@ export async function chatCompletions(c: Context) {
             }
           }
 
-          // Trim processed portion from buffer
-          if (startIdx > 0) {
-            buffer = buffer.slice(startIdx);
+          if (bufferOffset > 0) {
+            buffer = buffer.slice(bufferOffset);
+            bufferOffset = 0;
           }
 
-          // Periodic yielding to prevent event loop starvation
-          chunkCount++;
-          if (chunkCount % 100 === 0) {
-            await new Promise(r => setTimeout(r, 0));
-          }
         }
 
         const upstreamError = parseQwenErrorPayload(buffer);
@@ -778,7 +828,7 @@ export async function chatCompletionsStop(c: Context) {
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'same-origin',
         'User-Agent': stream.headers['user-agent'],
-        'X-Request-Id': uuidv4(),
+        'X-Request-Id': crypto.randomUUID(),
         'bx-ua': stream.headers['bx-ua'],
         'bx-umidtoken': stream.headers['bx-umidtoken'],
         'bx-v': stream.headers['bx-v'],

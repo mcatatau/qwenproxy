@@ -5,7 +5,7 @@
  * Supports both JSON and Hermes-style XML <parameter> formats.
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import { robustParseJSON } from '../utils/json.js';
 import { logger } from '../core/logger.js';
 import type { ParsedToolCall } from './types';
@@ -183,6 +183,11 @@ export class StreamingToolParser {
 
     while (this.buffer.length > 0) {
       if (!this.insideTool) {
+        if (this.buffer.indexOf('<') === -1) {
+          if (this.emittedToolCallCount === 0) result.text += this.buffer;
+          this.buffer = '';
+          break;
+        }
         const match = this.buffer.match(TOOL_OPEN_RE);
         if (match && match.index !== undefined) {
           // Text before the tool call tag
@@ -294,7 +299,7 @@ export class StreamingToolParser {
     const xmlParsed = parseXmlParameterToolCall(t, this.currentOpenTag, this.tools);
     if (xmlParsed) {
       result.toolCalls.push({
-        id: `call_${uuidv4()}`,
+        id: `call_${crypto.randomUUID()}`,
         name: xmlParsed.name,
         arguments: xmlParsed.arguments,
       });
@@ -357,7 +362,7 @@ export class StreamingToolParser {
     const xmlParsed = parseXmlParameterToolCall(block, this.currentOpenTag, this.tools);
     if (xmlParsed) {
       return {
-        id: `call_${uuidv4()}`,
+        id: `call_${crypto.randomUUID()}`,
         name: xmlParsed.name,
         arguments: xmlParsed.arguments,
       };
@@ -367,7 +372,7 @@ export class StreamingToolParser {
     const recovered = parseRecoverableXmlToolCall(block, this.currentOpenTag, this.tools);
     if (recovered) {
       return {
-        id: `call_${uuidv4()}`,
+        id: `call_${crypto.randomUUID()}`,
         name: recovered.name,
         arguments: recovered.arguments,
       };
@@ -430,7 +435,7 @@ export class StreamingToolParser {
     if (typeof args !== 'object' || args === null) args = {};
 
     return {
-      id: parsed.id || parsed.tool_call_id || `call_${uuidv4()}`,
+      id: parsed.id || parsed.tool_call_id || `call_${crypto.randomUUID()}`,
       name,
       arguments: args,
     };

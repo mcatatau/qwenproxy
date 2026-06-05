@@ -64,9 +64,10 @@ export class MemoryCache {
 
   async set<T>(key: CacheKey, value: T, ttl?: number): Promise<void> {
     const serialized = JSON.stringify(value)
+    const valueBytes = Buffer.byteLength(serialized)
     const effectiveTTL = ttl || this.defaultTTL
     const fullKey = this.prefix + key
-    const entrySize = this.entryByteSize(fullKey, value)
+    const entrySize = Buffer.byteLength(fullKey) + valueBytes
     
     if (this.store.has(fullKey)) {
       const oldEntry = this.store.get(fullKey)
@@ -84,7 +85,7 @@ export class MemoryCache {
     this.totalBytes += entrySize
     
     metrics.increment('cache.set')
-    metrics.histogram('cache.value.size', Buffer.byteLength(serialized))
+    metrics.histogram('cache.value.size', valueBytes)
   }
 
   async get<T>(key: CacheKey): Promise<T | null> {

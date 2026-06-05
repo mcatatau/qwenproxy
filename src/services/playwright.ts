@@ -29,6 +29,7 @@ interface AccountHeaderCache {
 }
 
 const accountHeaderCaches = new Map<string, AccountHeaderCache>();
+const cachedUserAgents = new Map<string, string>();
 
 function getAccountHeaderCache(accountId: string): AccountHeaderCache {
   let cache = accountHeaderCaches.get(accountId);

@@ -6,7 +6,7 @@
 
 import { Context } from "hono";
 import { getQwenHeaders } from "../services/playwright.ts";
-import { v4 as uuidv4 } from "uuid";
+import crypto from "crypto";
 
 interface STSResponse {
   success: boolean;
@@ -46,7 +46,7 @@ async function getSTSToken(
           Origin: "https://chat.qwen.ai",
           Referer: "https://chat.qwen.ai/",
           "User-Agent": headers["user-agent"],
-          "X-Request-Id": uuidv4(),
+          "X-Request-Id": crypto.randomUUID(),
           "bx-ua": headers["bx-ua"],
           "bx-umidtoken": headers["bx-umidtoken"],
           "bx-v": headers["bx-v"],
@@ -723,11 +723,11 @@ export async function processImagesForQwen(
           greenNet: "success",
           size: fileSize,
           error: "",
-          itemId: uuidv4(),
+          itemId: crypto.randomUUID(),
           file_type: typeInfo.mime,
           showType: typeInfo.showType,
           file_class: typeInfo.fileClass,
-          uploadTaskId: uuidv4(),
+          uploadTaskId: crypto.randomUUID(),
         });
       }
     }

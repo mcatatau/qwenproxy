@@ -31,7 +31,7 @@ function truncateSemantically(content: string, maxChars: number): string {
 }
 
 export function truncateMessages(
-  messages: Array<{ role: string; content: string | null | any[] }>,
+  messages: Array<{ role: string; content: string | null | any[] | Record<string, unknown> }>,
   maxContextLength: number,
   systemPrompt: string = ''
 ): Array<{ role: string; content: string }> {

@@ -1,3 +1,10 @@
+## [1.3.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.3.2...v1.3.3) (2026-06-10)
+
+
+### Performance Improvements
+
+* remove artificial random delay, increase warm pool, optimize TMD detection ([5610487](https://github.com/pedrofariasx/qwenproxy/commit/5610487a0a2df3c48add8d800fb4b8de4e77f582))
+
 ## [1.3.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.3.1...v1.3.2) (2026-06-10)
 
 

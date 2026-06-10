@@ -1,5 +1,6 @@
 import { getQwenHeaders, getBasicHeaders } from './playwright.js';
 import { MAX_PAYLOAD_SIZE } from '../core/model-registry.js';
+import { markAccountRateLimited } from '../core/account-manager.js';
 import crypto from 'crypto';
 
 const CACHED_TIMEZONE = new Date().toString().split(' (')[0];
@@ -184,7 +185,15 @@ async function refillPoolForAccount(accountId: string) {
     try {
       const chatId = await createRealQwenChat(headers);
       return { chatId, headers, accountId, timestamp: Date.now() };
-    } catch (err) {
+    } catch (err: any) {
+      if (err instanceof QwenUpstreamError) {
+        if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
+          const hourHint = err.message?.match(/Wait about (\d+) hour/);
+          const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+          markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
+          console.warn(`[WarmPool] Account ${accountId} rate-limited during chat creation. Marked for cooldown.`);
+        }
+      }
       console.error(`[WarmPool] chat creation failed for ${accountId}:`, (err as Error).message);
       return null;
     }
@@ -588,6 +597,26 @@ export async function createQwenStream(
         }
 
         if (retryResponse.ok && retryResponse.body) {
+          try {
+            const errorJson = JSON.parse(retryPeek);
+            if (errorJson && (errorJson.success === false || errorJson.error)) {
+              const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
+              const details = errorJson.data?.details || errorJson.message || errorJson.error?.message || 'Qwen returned an error';
+              const wait = errorJson.data?.num !== undefined
+                ? ` Wait about ${errorJson.data.num} hour(s) before trying again.`
+                : '';
+              let status = 502;
+              if (code === 'RateLimited') status = 429;
+              
+              throw new QwenUpstreamError(
+                `Qwen upstream error: ${code}: ${details}.${wait}`,
+                code,
+                status,
+              );
+            }
+          } catch (e) {
+            if (e instanceof QwenUpstreamError) throw e;
+          }
           return { stream: retryResponse.body, headers: freshHeaders, uiSessionId: chatId, controller: retryController, accountId: chatEntry.accountId };
         }
       } catch (retryErr) {
@@ -600,6 +629,27 @@ export async function createQwenStream(
         'FAIL_SYS_USER_VALIDATE',
         403,
       );
+    } else {
+      try {
+        const errorJson = JSON.parse(peekText);
+        if (errorJson && (errorJson.success === false || errorJson.error)) {
+          const code = errorJson.data?.code || errorJson.code || 'UpstreamError';
+          const details = errorJson.data?.details || errorJson.message || errorJson.error?.message || 'Qwen returned an error';
+          const wait = errorJson.data?.num !== undefined
+            ? ` Wait about ${errorJson.data.num} hour(s) before trying again.`
+            : '';
+          let status = 502;
+          if (code === 'RateLimited') status = 429;
+          
+          throw new QwenUpstreamError(
+            `Qwen upstream error: ${code}: ${details}.${wait}`,
+            code,
+            status,
+          );
+        }
+      } catch (e) {
+        if (e instanceof QwenUpstreamError) throw e;
+      }
     }
   }
 

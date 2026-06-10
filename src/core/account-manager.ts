@@ -129,25 +129,33 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
   return best
 }
 
-export function getNextAvailableAccount(skipAccountId?: string): QwenAccount | null {
+export function getNextAvailableAccount(triedAccountIds?: Set<string> | string): QwenAccount | null {
   const accounts = getCachedAccounts()
   if (accounts.length === 0) return null
 
+  let triedSet: Set<string>
+  if (triedAccountIds instanceof Set) {
+    triedSet = triedAccountIds
+  } else {
+    triedSet = new Set(triedAccountIds ? [triedAccountIds] : [])
+  }
+
+  // 1. Try to find an untried account that is NOT on cooldown
   for (let i = 0; i < accounts.length; i++) {
     const idx = (currentIndex + i) % accounts.length
     const account = accounts[idx]
-    if (skipAccountId && account.id === skipAccountId) continue
+    if (triedSet.has(account.id)) continue
     if (!isAccountOnCooldown(account.id)) {
       currentIndex = (idx + 1) % accounts.length
       return account
     }
   }
 
-  // All remaining accounts on cooldown — return the one with shortest cooldown
+  // 2. If all untried accounts are on cooldown, return the untried one with the shortest remaining cooldown
   let best: QwenAccount | null = null
   let bestRemaining = Infinity
   for (const account of accounts) {
-    if (skipAccountId && account.id === skipAccountId) continue
+    if (triedSet.has(account.id)) continue
     const info = getAccountCooldownInfo(account.id)
     if (info && info.remainingMs < bestRemaining) {
       bestRemaining = info.remainingMs

@@ -21,6 +21,7 @@ import { QwenStreamParser, ParsedChunkResult } from '../utils/qwen-stream-parser
 import { getModelContextWindow } from '../core/model-registry.js'
 import { truncateMessages, estimateTokenCount } from '../utils/context-truncation.js';
 import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, getAccountCooldownInfo } from '../core/account-manager.js';
+import { loadAccounts } from '../core/accounts.js';
 import { registerStream, removeStream, getStream } from '../core/stream-registry.js';
 import { metrics } from '../core/metrics.js'
 
@@ -284,7 +285,7 @@ export async function chatCompletions(c: Context) {
       const accountEmail = account.email;
 
       if (triedAccountIds.has(accountId)) {
-        account = getNextAvailableAccount(accountId);
+        account = getNextAvailableAccount(triedAccountIds);
         continue;
       }
       triedAccountIds.add(accountId);
@@ -292,7 +293,7 @@ export async function chatCompletions(c: Context) {
       const cooldownInfo = getAccountCooldownInfo(accountId);
       if (cooldownInfo && accountId !== 'global') {
         console.log(`[Chat] Skipping account ${accountEmail} (${accountId}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
-        account = getNextAvailableAccount(accountId);
+        account = getNextAvailableAccount(triedAccountIds);
         continue;
       }
 
@@ -329,9 +330,10 @@ export async function chatCompletions(c: Context) {
 
           if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
             const hourHint = err.message?.match(/Wait about (\d+) hour/);
-            const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+            const hours = hourHint ? parseInt(hourHint[1]) : 24;
+            const cooldownMs = hours * 60 * 60 * 1000;
             markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
-            console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Marked for cooldown.`);
+            console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Entering cooldown for ${hours} hours.`);
             lastError = err;
             break;
           }
@@ -364,11 +366,17 @@ export async function chatCompletions(c: Context) {
         break;
       }
 
-      account = getNextAvailableAccount(accountId);
+      account = getNextAvailableAccount(triedAccountIds);
     }
 
     if (!stream) {
       removeStream(completionId);
+      // Check if all accounts are on cooldown
+      const accounts = loadAccounts();
+      const allOnCooldown = accounts.every(a => getAccountCooldownInfo(a.id) !== null);
+      if (allOnCooldown) {
+        console.warn(`[Chat] CRITICAL: All ${accounts.length} accounts are currently rate-limited or on cooldown!`);
+      }
       throw lastError || new Error('All accounts failed');
     }
 

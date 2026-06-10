@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.3.1...v1.3.2) (2026-06-10)
+
+
+### Performance Improvements
+
+* reduce random delay and revert warm pool to lightweight headers ([1b28c07](https://github.com/pedrofariasx/qwenproxy/commit/1b28c07a30fb6b54477ed2d91772c1a5b5636278))
+
 ## [1.3.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.3.0...v1.3.1) (2026-06-10)
 
 

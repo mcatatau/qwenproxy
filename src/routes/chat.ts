@@ -272,48 +272,75 @@ export async function chatCompletions(c: Context) {
     const isNewSession = !messages.some(m => m.role === 'assistant');
 
     // Account selection with fallback on rate-limit/failure
-    let account = getNextAccount();
-    const triedAccountIds = new Set<string>();
-    let lastError: any = null;
-
+    const isGuestModeOnly = process.env.QWEN_GUEST_MODE_ONLY?.toLowerCase() === 'true';
     let stream: ReadableStream | undefined;
     let uiSessionId = '';
     const completionId = 'chatcmpl-' + crypto.randomUUID();
+    let lastError: any = null;
 
-    while (account) {
-      const accountId = account.id;
-      const accountEmail = account.email;
-
-      if (triedAccountIds.has(accountId)) {
-        account = getNextAvailableAccount(triedAccountIds);
-        continue;
+    if (isGuestModeOnly) {
+      console.log('[Chat] Guest mode only enabled. Bypassing account rotation.');
+      try {
+        const result = await createQwenStream(
+          finalPrompt,
+          isThinkingModel,
+          body.model,
+          null,
+          'guest',
+          undefined,
+          pendingMultimodal.length > 0 ? pendingMultimodal : undefined
+        );
+        stream = result.stream;
+        uiSessionId = result.uiSessionId;
+        registerStream(completionId, {
+          abortController: result.controller,
+          accountId: 'guest',
+          uiSessionId: result.uiSessionId,
+          targetResponseId: '',
+          headers: result.headers,
+        });
+      } catch (err: any) {
+        console.error('[Chat] Guest mode failed:', err.message);
+        throw err;
       }
-      triedAccountIds.add(accountId);
+    } else {
+      let account = getNextAccount();
+      const triedAccountIds = new Set<string>();
 
-      const cooldownInfo = getAccountCooldownInfo(accountId);
-      if (cooldownInfo && accountId !== 'global') {
-        console.log(`[Chat] Skipping account ${accountEmail} (${accountId}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
-        account = getNextAvailableAccount(triedAccountIds);
-        continue;
-      }
+      while (account) {
+        const accountId = account.id;
+        const accountEmail = account.email;
 
-      console.log(`[Chat] Routing request to account: ${accountEmail} (${accountId})`);
+        if (triedAccountIds.has(accountId)) {
+          account = getNextAvailableAccount(triedAccountIds);
+          continue;
+        }
+        triedAccountIds.add(accountId);
 
-      let retries = 3;
-      let retryDelay = 500;
-      let success = false;
+        const cooldownInfo = getAccountCooldownInfo(accountId);
+        if (cooldownInfo && accountId !== 'global') {
+          console.log(`[Chat] Skipping account ${accountEmail} (${accountId}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
+          account = getNextAvailableAccount(triedAccountIds);
+          continue;
+        }
 
-      while (retries > 0) {
-        try {
-          const result = await createQwenStream(
-            finalPrompt,
-            isThinkingModel,
-            body.model,
-            null, // Always force new chat for concurrency isolation
-            accountId === 'global' ? undefined : accountId,
-            undefined,
-            pendingMultimodal.length > 0 ? pendingMultimodal : undefined
-          );
+        console.log(`[Chat] Routing request to account: ${accountEmail} (${accountId})`);
+
+        let retries = 3;
+        let retryDelay = 500;
+        let success = false;
+
+        while (retries > 0) {
+          try {
+            const result = await createQwenStream(
+              finalPrompt,
+              isThinkingModel,
+              body.model,
+              null, // Always force new chat for concurrency isolation
+              accountId === 'global' ? undefined : accountId,
+              undefined,
+              pendingMultimodal.length > 0 ? pendingMultimodal : undefined
+            );
             stream = result.stream;
             uiSessionId = result.uiSessionId;
             registerStream(completionId, {
@@ -325,59 +352,84 @@ export async function chatCompletions(c: Context) {
             });
             success = true;
             break;
-        } catch (err: any) {
-          retries--;
+          } catch (err: any) {
+            retries--;
 
-          if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-            const hourHint = err.message?.match(/Wait about (\d+) hour/);
-            const hours = hourHint ? parseInt(hourHint[1]) : 24;
-            const cooldownMs = hours * 60 * 60 * 1000;
-            markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
-            console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Entering cooldown for ${hours} hours.`);
-            lastError = err;
-            break;
-          }
-
-          if (retries === 0) {
-            if (err.upstreamStatus && err.upstreamStatus >= 500) {
-              markAccountRateLimited(accountId, undefined, 'ServerError');
-              console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
+            if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
+              const hourHint = err.message?.match(/Wait about (\d+) hour/);
+              const hours = hourHint ? parseInt(hourHint[1]) : 24;
+              const cooldownMs = hours * 60 * 60 * 1000;
+              markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
+              console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Entering cooldown for ${hours} hours.`);
+              lastError = err;
+              break;
             }
-            lastError = err;
-            break;
-          }
 
-          let useDelay = retryDelay;
-          if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
-            useDelay = err.retryAfterMs;
+            if (retries === 0) {
+              if (err.upstreamStatus && err.upstreamStatus >= 500) {
+                markAccountRateLimited(accountId, undefined, 'ServerError');
+                console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
+              }
+              lastError = err;
+              break;
+            }
+
+            let useDelay = retryDelay;
+            if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
+              useDelay = err.retryAfterMs;
+            }
+            const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+            if (!isRetryable) {
+              lastError = err;
+              break;
+            }
+            console.warn(`[Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left)`);
+            await new Promise(r => setTimeout(r, useDelay));
+            retryDelay = Math.min(retryDelay * 2, 5000);
           }
-          const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
-          if (!isRetryable) {
-            lastError = err;
-            break;
-          }
-          console.warn(`[Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left)`);
-          await new Promise(r => setTimeout(r, useDelay));
-          retryDelay = Math.min(retryDelay * 2, 5000);
         }
-      }
 
-      if (success) {
-        break;
-      }
+        if (success) {
+          break;
+        }
 
-      account = getNextAvailableAccount(triedAccountIds);
+        account = getNextAvailableAccount(triedAccountIds);
+      }
     }
 
     if (!stream) {
       removeStream(completionId);
-      // Check if all accounts are on cooldown
       const accounts = loadAccounts();
-      const allOnCooldown = accounts.every(a => getAccountCooldownInfo(a.id) !== null);
+      const allOnCooldown = accounts.length === 0 || accounts.every(a => getAccountCooldownInfo(a.id) !== null);
+      
       if (allOnCooldown) {
-        console.warn(`[Chat] CRITICAL: All ${accounts.length} accounts are currently rate-limited or on cooldown!`);
+        console.warn(`[Chat] CRITICAL: All accounts are rate-limited, on cooldown, or none configured! Falling back to GUEST mode.`);
+        try {
+          const result = await createQwenStream(
+            finalPrompt,
+            isThinkingModel,
+            body.model,
+            null,
+            'guest',
+            undefined,
+            pendingMultimodal.length > 0 ? pendingMultimodal : undefined
+          );
+          stream = result.stream;
+          uiSessionId = result.uiSessionId;
+          registerStream(completionId, {
+            abortController: result.controller,
+            accountId: 'guest',
+            uiSessionId: result.uiSessionId,
+            targetResponseId: '',
+            headers: result.headers,
+          });
+        } catch (guestErr: any) {
+          console.error('[Chat] Guest mode also failed:', guestErr.message);
+          throw lastError || new Error('All accounts and guest mode failed');
+        }
+      } else {
+        throw lastError || new Error('All accounts failed');
       }
-      throw lastError || new Error('All accounts failed');
     }
 
     if (!isStream) {

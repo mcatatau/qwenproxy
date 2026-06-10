@@ -188,9 +188,28 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
   }
   
   const cache = getAccountHeaderCache(cacheKey);
+  let bxUa = cache.currentHeaders['bx-ua'];
+  let bxUmidtoken = cache.currentHeaders['bx-umidtoken'];
   const bxV = cache.currentHeaders['bx-v'] || '2.5.36';
-  const bxUa = cache.currentHeaders['bx-ua'];
-  const bxUmidtoken = cache.currentHeaders['bx-umidtoken'];
+  
+  // Auto-recover missing anti-fraud headers by triggering full header interception
+  if (!bxUa || !bxUmidtoken) {
+    console.log(`[Playwright] Missing bx-ua/bx-umidtoken for ${cacheKey}, triggering header interception...`);
+    try {
+      const result = await getQwenHeaders(true, accountId);
+      bxUa = result.headers['bx-ua'];
+      bxUmidtoken = result.headers['bx-umidtoken'];
+      return {
+        cookie: await getCookies(accountId),
+        userAgent,
+        bxV: result.headers['bx-v'] || bxV,
+        bxUa,
+        bxUmidtoken,
+      };
+    } catch (err: any) {
+      console.warn(`[Playwright] Failed to auto-recover headers for ${cacheKey}: ${err.message}`);
+    }
+  }
   
   return { cookie, userAgent, bxV, bxUa, bxUmidtoken };
 }
@@ -648,6 +667,25 @@ export async function initPlaywrightForAccount(account: QwenAccount, headless = 
 
   if (!hasAuthCookie && account.email && account.password) {
     await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+  }
+
+  // Navigate to Qwen home to validate session and populate cookies
+  try {
+    await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const url = acctPage.url();
+    if (url.includes('auth') || url.includes('login')) {
+      if (account.email && account.password) {
+        console.log(`[Playwright] Session expired for ${account.email}, re-logging in...`);
+        await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+        await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+      } else {
+        console.warn(`[Playwright] Session expired for account ${account.id} but no credentials available for re-login.`);
+      }
+    } else {
+      console.log(`[Playwright] Session validated for ${account.email}.`);
+    }
+  } catch (err: any) {
+    console.warn(`[Playwright] Failed to validate session for ${account.email}: ${err.message}`);
   }
 }
 

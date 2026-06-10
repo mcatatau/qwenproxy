@@ -68,6 +68,49 @@ const REFRESH_THRESHOLD = 0.7;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+function getStealthScript(): string {
+  return `
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['pt-BR', 'pt', 'en-US', 'en'],
+    });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+    window.chrome = {
+      runtime: {},
+      loadTimes: function() {},
+      csi: function() {},
+      app: {},
+    };
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+      parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters);
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37445) return 'Intel Inc.';
+      if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+      return getParameter.apply(this, arguments);
+    };
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({
+        effectiveType: '4g',
+        rtt: 50,
+        downlink: 10,
+        saveData: false,
+      }),
+    });
+    delete navigator.__proto__.webdriver;
+  `;
+}
+
 export class Mutex {
   private queue: (() => void)[] = [];
   private locked = false;
@@ -169,15 +212,15 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-infobars',
+      '--no-first-run',
+      '--no-default-browser-check',
     ]
   });
 
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-  });
+  await context.addInitScript(getStealthScript());
 
   activePage = await context.newPage();
 
@@ -586,15 +629,15 @@ export async function initPlaywrightForAccount(account: QwenAccount, headless = 
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-infobars',
+      '--no-first-run',
+      '--no-default-browser-check',
     ]
   });
 
-  await acctContext.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-  });
+  await acctContext.addInitScript(getStealthScript());
 
   const acctPage = await acctContext.newPage();
   accountContexts.set(account.id, acctContext);
@@ -618,15 +661,15 @@ export async function launchManualLoginAccount(accountId: string, browserType: B
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-infobars',
+      '--no-first-run',
+      '--no-default-browser-check',
     ]
   });
 
-  await acctContext.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-  });
+  await acctContext.addInitScript(getStealthScript());
 
   const acctPage = await acctContext.newPage();
   await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });

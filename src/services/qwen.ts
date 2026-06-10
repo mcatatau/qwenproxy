@@ -6,6 +6,20 @@ const CACHED_TIMEZONE = new Date().toString().split(' (')[0];
 const BASE_TIMEOUT_MS = 120000;
 const TIMEOUT_PER_MB = 30000;
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+function getClientHintsHeaders(): Record<string, string> {
+  return {
+    'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+  };
+}
+
+function getRandomDelay(): number {
+  return 200 + Math.floor(Math.random() * 600);
+}
+
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
   constructor(message: string, retryAfterMs: number) {
@@ -83,11 +97,13 @@ function cleanupStalePool(accountId: string) {
 }
 
 async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, string>> {
-  const { cookie, userAgent, bxV } = await getBasicHeaders(accountId);
+  const { cookie, userAgent, bxV, bxUa, bxUmidtoken } = await getBasicHeaders(accountId);
   return {
     cookie,
     'user-agent': userAgent,
     'bx-v': bxV,
+    'bx-ua': bxUa || '',
+    'bx-umidtoken': bxUmidtoken || '',
   };
 }
 
@@ -104,6 +120,9 @@ async function createRealQwenChat(header: Record<string, string>): Promise<strin
       'user-agent': header['user-agent'],
       'x-request-id': crypto.randomUUID(),
       'bx-v': header['bx-v'],
+      'bx-ua': header['bx-ua'] || '',
+      'bx-umidtoken': header['bx-umidtoken'] || '',
+      ...getClientHintsHeaders(),
     },
     body: JSON.stringify({
       title: 'Nova Conversa',
@@ -132,7 +151,19 @@ async function refillPoolForAccount(accountId: string) {
 
   let headers: Record<string, string>;
   try {
-    headers = await getBasicQwenHeaders(accountId === 'global' ? undefined : accountId);
+    const acctId = accountId === 'global' ? undefined : accountId;
+    try {
+      const { headers: fullHeaders } = await getQwenHeaders(false, acctId);
+      headers = {
+        cookie: fullHeaders['cookie'] || '',
+        'user-agent': fullHeaders['user-agent'] || '',
+        'bx-v': fullHeaders['bx-v'] || '',
+        'bx-ua': fullHeaders['bx-ua'] || '',
+        'bx-umidtoken': fullHeaders['bx-umidtoken'] || '',
+      };
+    } catch {
+      headers = await getBasicQwenHeaders(acctId);
+    }
   } catch (err) {
     console.error(`[WarmPool] header fetch failed for ${accountId}:`, (err as Error).message);
     return;
@@ -295,7 +326,7 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
     return cachedModels;
   }
 
-  const { cookie, userAgent, bxV } = await getBasicHeaders(accountId);
+  const { cookie, userAgent, bxV, bxUa, bxUmidtoken } = await getBasicHeaders(accountId);
 
   const response = await fetch('https://chat.qwen.ai/api/models', {
     headers: {
@@ -306,8 +337,11 @@ export async function fetchQwenModels(accountId?: string): Promise<any[]> {
       'user-agent': userAgent,
       'x-request-id': crypto.randomUUID(),
       'bx-v': bxV,
+      'bx-ua': bxUa || '',
+      'bx-umidtoken': bxUmidtoken || '',
       'timezone': CACHED_TIMEZONE,
-      'source': 'web'
+      'source': 'web',
+      ...getClientHintsHeaders(),
     }
   });
 
@@ -466,6 +500,7 @@ export async function createQwenStream(
   const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  await sleep(getRandomDelay());
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -483,11 +518,81 @@ export async function createQwenStream(
       'x-accel-buffering': 'no',
       'x-request-id': crypto.randomUUID(),
       'bx-v': chatHeaders['bx-v'],
+      'bx-ua': chatHeaders['bx-ua'] || '',
+      'bx-umidtoken': chatHeaders['bx-umidtoken'] || '',
+      ...getClientHintsHeaders(),
     },
     body: payloadJson,
     signal: controller.signal
   });
   clearTimeout(timeoutId);
+
+  const responseContentType = response.headers.get('content-type') || '';
+  if (response.ok && responseContentType.includes('application/json') && response.body) {
+    const cloned = response.clone();
+    const peekText = await cloned.text().catch(() => '');
+    if (peekText.includes('FAIL_SYS_USER_VALIDATE') || peekText.includes('_____tmd_____') || peekText.includes('RGV587_ERROR')) {
+      console.warn('[Qwen] TMD challenge detected, refreshing headers and retrying...');
+      try {
+        const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+        await sleep(1000 + Math.floor(Math.random() * 2000));
+        const retryController = new AbortController();
+        const retryTimeoutId = setTimeout(() => retryController.abort(), timeoutMs);
+        const retryResponse = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'accept': 'application/json',
+            'accept-language': 'pt-BR,pt;q=0.9',
+            'content-type': 'application/json',
+            'cookie': freshHeaders['cookie'],
+            'origin': 'https://chat.qwen.ai',
+            'referer': `https://chat.qwen.ai/c/${chatId}`,
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'timezone': CACHED_TIMEZONE,
+            'user-agent': freshHeaders['user-agent'],
+            'x-accel-buffering': 'no',
+            'x-request-id': crypto.randomUUID(),
+            'bx-v': freshHeaders['bx-v'],
+            'bx-ua': freshHeaders['bx-ua'] || '',
+            'bx-umidtoken': freshHeaders['bx-umidtoken'] || '',
+            ...getClientHintsHeaders(),
+          },
+          body: payloadJson,
+          signal: retryController.signal
+        });
+        clearTimeout(retryTimeoutId);
+
+        const retryContentType = retryResponse.headers.get('content-type') || '';
+        if (retryResponse.ok && retryContentType.includes('text/event-stream') && retryResponse.body) {
+          return { stream: retryResponse.body, headers: freshHeaders, uiSessionId: chatId, controller: retryController, accountId: chatEntry.accountId };
+        }
+
+        const retryPeek = await retryResponse.clone().text().catch(() => '');
+        if (retryPeek.includes('FAIL_SYS_USER_VALIDATE') || retryPeek.includes('_____tmd_____')) {
+          throw new QwenUpstreamError(
+            'Qwen TMD challenge persists after header refresh. The account may need manual captcha resolution.',
+            'FAIL_SYS_USER_VALIDATE',
+            403,
+          );
+        }
+
+        if (retryResponse.ok && retryResponse.body) {
+          return { stream: retryResponse.body, headers: freshHeaders, uiSessionId: chatId, controller: retryController, accountId: chatEntry.accountId };
+        }
+      } catch (retryErr) {
+        if (retryErr instanceof QwenUpstreamError) throw retryErr;
+        console.error('[Qwen] TMD retry failed:', (retryErr as Error).message);
+      }
+
+      throw new QwenUpstreamError(
+        'Qwen TMD anti-bot challenge detected. Headers were refreshed but the challenge persists.',
+        'FAIL_SYS_USER_VALIDATE',
+        403,
+      );
+    }
+  }
 
   if (!response.ok || !response.body) {
     const errText = await response.text().catch(() => '');

@@ -1,3 +1,10 @@
+## [1.6.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.2...v1.6.3) (2026-06-12)
+
+
+### Bug Fixes
+
+* restore header interception by reverting to click-first send logic with Enter fallback ([f994a53](https://github.com/pedrofariasx/qwenproxy/commit/f994a53ed1de17e9b8c315d9bd67efcd5e44d909))
+
 ## [1.6.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.1...v1.6.2) (2026-06-12)
 
 

@@ -1,3 +1,10 @@
+## [1.6.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.1...v1.6.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* restore header interception reliability by increasing input/update delays ([7cd31c4](https://github.com/pedrofariasx/qwenproxy/commit/7cd31c4589558a2bcf2a1fb4b4f5c89dbe3f8790))
+
 ## [1.6.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.0...v1.6.1) (2026-06-12)
 
 

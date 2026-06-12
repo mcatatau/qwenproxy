@@ -1,3 +1,11 @@
+## [1.6.4](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.3...v1.6.4) (2026-06-12)
+
+
+### Performance Improvements
+
+* make all timeouts configurable via env and increase defaults for slow connections ([c0c486a](https://github.com/pedrofariasx/qwenproxy/commit/c0c486af46a3a65e5eb15c26268a66b038c3d764))
+* reuse existing unused chats from API before creating new ones in warm pool ([3ce801b](https://github.com/pedrofariasx/qwenproxy/commit/3ce801b181d1facfbe13a5c7dfd1aa2e6d9c90ed))
+
 ## [1.6.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.2...v1.6.3) (2026-06-12)
 
 

@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.4...v1.7.0) (2026-06-15)
+
+
+### Features
+
+* improve large-context tool-call reliability ([dcc0ac1](https://github.com/pedrofariasx/qwenproxy/commit/dcc0ac10ff988a3c2b55d2cf689cf3cb0283c8b8))
+
 ## [1.6.4](https://github.com/pedrofariasx/qwenproxy/compare/v1.6.3...v1.6.4) (2026-06-12)
 
 

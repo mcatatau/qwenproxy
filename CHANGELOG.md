@@ -1,3 +1,10 @@
+# [1.9.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.8.0...v1.9.0) (2026-06-21)
+
+
+### Features
+
+* implement advanced anti-detection with deterministic fingerprints and humanized behavior ([f2af6d7](https://github.com/pedrofariasx/qwenproxy/commit/f2af6d70bb45faf94d8b2f1c47b52cd775c49ff3))
+
 # [1.8.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.7.3...v1.8.0) (2026-06-19)
 
 

@@ -20,6 +20,7 @@ export interface ParserResult {
 
 const TOOL_OPEN_RE = /<tool_call\b[^>]*>/i;
 const TOOL_END = '</tool_call>';
+const TOOL_SHORT_END = '</tool>';
 
 function decodeXmlEntities(value: string): string {
   return value
@@ -205,27 +206,70 @@ function parseRecoverableXmlToolCall(
 
 // ─── String-Aware Tag Detection ─────────────────────────────────────────────────
 
-function findToolEndIndex(buffer: string): number {
-  const tagLen = TOOL_END.length;
-  const limit = buffer.length - tagLen;
+function matchesCaseInsensitiveAt(buffer: string, index: number, value: string): boolean {
+  if (index + value.length > buffer.length) return false;
+  for (let j = 0; j < value.length; j++) {
+    const c = buffer.charCodeAt(index + j);
+    const t = value.charCodeAt(j);
+    if (c !== t && (c | 0x20) !== (t | 0x20)) return false;
+  }
+  return true;
+}
+
+function findToolEndMatch(buffer: string): { index: number; length: number } | null {
   let inString = false;
   let escaped = false;
 
-  for (let i = 0; i <= limit; i++) {
+  for (let i = 0; i < buffer.length; i++) {
     const ch = buffer[i];
     if (escaped) { escaped = false; continue; }
     if (ch === '\\') { escaped = true; continue; }
     if (ch === '"') { inString = !inString; continue; }
     if (inString || ch !== '<') continue;
-    let match = true;
-    for (let j = 1; j < tagLen; j++) {
-      const c = buffer.charCodeAt(i + j);
-      const t = TOOL_END.charCodeAt(j);
-      if (c !== t && (c | 0x20) !== (t | 0x20)) { match = false; break; }
+
+    if (matchesCaseInsensitiveAt(buffer, i, TOOL_END)) {
+      return { index: i, length: TOOL_END.length };
     }
-    if (match) return i;
+
+    if (matchesCaseInsensitiveAt(buffer, i, TOOL_SHORT_END)) {
+      return { index: i, length: TOOL_SHORT_END.length };
+    }
+
+    // Some editor clients append environment metadata immediately after a model
+    // emits a truncated closing tag, producing values like
+    // `</tool<environment_details>` or `</<environment_details>`. Treat only
+    // those prefixes as closing boundaries; otherwise wait for more chunks.
+    for (const truncatedClose of ['</tool', '</']) {
+      if (matchesCaseInsensitiveAt(buffer, i, truncatedClose) && buffer[i + truncatedClose.length] === '<') {
+        const after = buffer.substring(i + truncatedClose.length);
+        if (startsWithEnvironmentDetails(after)) {
+          return { index: i, length: truncatedClose.length };
+        }
+      }
+    }
+
+    if (matchesCaseInsensitiveAt(buffer, i, '</tool')) {
+      const next = buffer[i + '</tool'.length];
+      if (next !== undefined && next !== '_' && next !== '>') {
+        return { index: i, length: '</tool'.length };
+      }
+    }
   }
-  return -1;
+  return null;
+}
+
+function findRecoverableTailEndMatch(buffer: string): { index: number; length: number } | null {
+  for (const tag of [TOOL_END, TOOL_SHORT_END]) {
+    const index = buffer.toLowerCase().lastIndexOf(tag);
+    if (index !== -1 && index + tag.length === buffer.length) {
+      return { index, length: tag.length };
+    }
+  }
+  return null;
+}
+
+function startsWithEnvironmentDetails(buffer: string): boolean {
+  return /^\s*<environment_details\b/i.test(buffer);
 }
 
 
@@ -329,14 +373,17 @@ export class StreamingToolParser {
           break;
         }
        } else {
-        let endIdx = findToolEndIndex(this.buffer);
-         if (endIdx === -1) endIdx = this.buffer.indexOf(TOOL_END);
-         if (endIdx !== -1) {
-          const content = this.buffer.substring(0, endIdx);
-          this.buffer = this.buffer.substring(endIdx + TOOL_END.length);
+        const endMatch = findToolEndMatch(this.buffer) || findRecoverableTailEndMatch(this.buffer);
+         if (endMatch) {
+          const content = this.buffer.substring(0, endMatch.index);
+          this.buffer = this.buffer.substring(endMatch.index + endMatch.length);
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
+          if (this.emittedToolCallCount > 0 && startsWithEnvironmentDetails(this.buffer)) {
+            this.buffer = '';
+            break;
+          }
           if (this.buffer.length > 0) {
             const nextMatch = this.buffer.match(TOOL_OPEN_RE);
             if (nextMatch && nextMatch.index !== undefined) {

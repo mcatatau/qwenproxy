@@ -187,3 +187,56 @@ test('StreamingToolParser: parses OpenAI-style tool_calls wrapper', () => {
   assert.strictEqual(res.toolCalls[0].name, 'lookup');
   assert.deepStrictEqual(res.toolCalls[0].arguments, { query: 'abc' });
 });
+
+test('StreamingToolParser: handles truncated close tag before environment details', () => {
+  const parser = new StreamingToolParser();
+  const input = `${TC_OPEN}{"name":"edit","arguments":{"path":"a.txt","content":"hello"}}</tool<environment_details>
+Current time: 2026-06-22T21:37:19-03:00
+Working directory: /tmp/project
+</environment_details>`;
+  const res = parser.feed(input);
+
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'edit');
+  assert.deepStrictEqual(res.toolCalls[0].arguments, { path: 'a.txt', content: 'hello' });
+  assert.strictEqual(res.text, '');
+});
+
+test('StreamingToolParser: handles bare truncated close before environment details', () => {
+  const parser = new StreamingToolParser();
+  const input = `${TC_OPEN}{"name":"edit","arguments":{"path":"a.txt","content":"hello"}}</<environment_details>
+Current time: 2026-06-22T21:41:36-03:00
+Working directory: /tmp/project
+</environment_details>`;
+  const res = parser.feed(input);
+
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'edit');
+  assert.deepStrictEqual(res.toolCalls[0].arguments, { path: 'a.txt', content: 'hello' });
+  assert.strictEqual(res.text, '');
+});
+
+test('StreamingToolParser: handles truncated close followed by plain text and environment details', () => {
+  const parser = new StreamingToolParser();
+  const input = `${TC_OPEN}{"name":"edit","arguments":{"path":"a.txt","content":"hello"}}</tool
+
+Ele manda como se fosse uma resposta de texto do modelo<environment_details>
+Current time: 2026-06-22T21:47:17-03:00
+Working directory: /home/pedro/Documentos/YouTube/qwenproxy
+Workspace root folder: /home/pedro/Documentos/YouTube/qwenproxy
+</environment_details>`;
+  const res = parser.feed(input);
+
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'edit');
+  assert.deepStrictEqual(res.toolCalls[0].arguments, { path: 'a.txt', content: 'hello' });
+  assert.ok(!res.text.includes('</tool'));
+});
+
+test('StreamingToolParser: handles short close tag', () => {
+  const parser = new StreamingToolParser();
+  const res = parser.feed(`${TC_OPEN}{"name":"write","arguments":{"path":"a.txt"}}</tool>`);
+
+  assert.strictEqual(res.toolCalls.length, 1);
+  assert.strictEqual(res.toolCalls[0].name, 'write');
+});

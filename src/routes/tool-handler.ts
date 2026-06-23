@@ -78,6 +78,77 @@ export function scoreToolForContext(tool: FunctionToolDefinition, contextText: s
   return score;
 }
 
+function splitToolText(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+function collectSchemaText(schema: any): string[] {
+  if (!schema || typeof schema !== 'object') return [];
+
+  const values: string[] = [];
+  if (typeof schema.description === 'string') values.push(schema.description);
+  if (typeof schema.title === 'string') values.push(schema.title);
+  if (typeof schema.const === 'string') values.push(schema.const);
+  if (Array.isArray(schema.enum)) values.push(...schema.enum.filter((item: unknown): item is string => typeof item === 'string'));
+
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const [key, value] of Object.entries(schema.properties)) {
+      values.push(key, ...collectSchemaText(value));
+    }
+  }
+
+  if (schema.items) values.push(...collectSchemaText(schema.items));
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(schema[key])) {
+      for (const item of schema[key]) values.push(...collectSchemaText(item));
+    }
+  }
+
+  return values;
+}
+
+export function isFileMutationTool(tool: FunctionToolDefinition): boolean {
+  const fn = getToolFunction(tool);
+  const schema = fn?.parameters || {};
+  const schemaText = collectSchemaText(schema);
+  const tokens = new Set(splitToolText([getToolName(tool), getToolDescription(tool), ...schemaText].join(' ')));
+
+  const hasFileTarget = ['file', 'files', 'path', 'filepath', 'uri', 'document', 'workspace', 'buffer'].some(token => tokens.has(token));
+  const hasMutationVerb = [
+    'append', 'apply', 'change', 'changes', 'create', 'delete', 'diff', 'edit', 'edits', 'insert', 'modify', 'move', 'overwrite',
+    'patch', 'remove', 'rename', 'replace', 'save', 'str', 'truncate', 'update', 'write'
+  ].some(token => tokens.has(token));
+  const hasMutationPayload = [
+    'content', 'diff', 'edit', 'edits', 'new', 'newtext', 'newstring', 'old', 'oldtext', 'oldstring', 'patch', 'replacement',
+    'text', 'value'
+  ].some(token => tokens.has(token));
+  const hasReadOnlyVerb = ['read', 'list', 'search', 'find', 'grep', 'show', 'get', 'open', 'view', 'inspect', 'diagnostics', 'hover', 'definition', 'references']
+    .some(token => tokens.has(token));
+
+  return (
+    hasFileTarget &&
+    hasMutationVerb &&
+    (hasMutationPayload || !hasReadOnlyVerb)
+  );
+}
+
+function appendMissingFileMutationTools(selected: FunctionToolDefinition[], tools: FunctionToolDefinition[]): FunctionToolDefinition[] {
+  const selectedNames = new Set(selected.map(getToolName));
+
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name || selectedNames.has(name) || !isFileMutationTool(tool)) continue;
+    selected.push(tool);
+    selectedNames.add(name);
+  }
+
+  return selected;
+}
+
 export function getRecentToolNames(messages: Message[]): Set<string> {
   const recentToolNames = new Set<string>();
   const recentMessages = messages.slice(-12);
@@ -111,10 +182,11 @@ export function selectCandidateTools(
     .sort((a, b) => b.score - a.score || getToolName(a.tool).localeCompare(getToolName(b.tool)));
 
   if (scored.length === 0) {
-    return tools.slice(0, maxTools);
+    return appendMissingFileMutationTools(tools.slice(0, maxTools), tools);
   }
 
-  return scored.slice(0, maxTools).map(entry => entry.tool);
+  const selected = scored.slice(0, maxTools).map(entry => entry.tool);
+  return appendMissingFileMutationTools(selected, tools);
 }
 
 export function buildCompactToolManifest(tools: FunctionToolDefinition[], forcedToolName = ''): string {
@@ -153,9 +225,14 @@ export function buildToolCallContract(
   const parallelLine = parallelToolCalls
     ? 'You may emit multiple tool call blocks only when the user explicitly asks for multiple independent actions.'
     : 'Emit at most one tool call block.';
+  const fileMutationNames = tools.filter(isFileMutationTool).map(getToolName).filter(Boolean);
+  const fileMutationLine = fileMutationNames.length > 0
+    ? `Workspace file mutation capabilities detected in these exact tools: ${fileMutationNames.join(', ')}. When the user asks to create, edit, patch, replace, rename, move, delete, or save files, choose the matching tool by its description and parameter schema, not by a preferred generic name.`
+    : '';
 
   return `[TOOL CALL CONTRACT - MUST FOLLOW]
 Available tool names: ${toolList}
+${fileMutationLine}
 Format:
 
 <tool_call>
@@ -163,8 +240,8 @@ Format:
 <` + `/tool_call>
 
 Rules:
-1. Use exact tool names from the list above or the full TOOLS AVAILABLE section.
-2. Do not invent, guess, rename, or approximate tool names.
+1. Use the exact tool name as provided by the client. Tool names vary by editor/integration; do not require names like read_file, edit_file, write_file, or apply_patch to exist.
+2. Do not invent, guess, rename, or approximate tool names. If a tool capability exists under a different name, call that exact provided name.
 3. Do not output raw JSON as a tool call.
 4. ${forcedLine}
 5. ${parallelLine}

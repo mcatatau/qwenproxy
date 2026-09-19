@@ -1,3 +1,10 @@
+# [1.31.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.30.0...v1.31.0) (2026-09-19)
+
+
+### Features
+
+* add reasoning_effort param, remove model variant duplicates, cleanup dead code ([fb85f7d](https://github.com/pedrofariasx/qwenproxy/commit/fb85f7dce31ed0293986f101d0afd34c1dd26b25))
+
 # [1.30.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.29.0...v1.30.0) (2026-09-08)
 
 

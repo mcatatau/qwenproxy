@@ -19,7 +19,7 @@ test('Health check endpoint returns 200', async () => {
   assert.ok(body.timestamp);
 });
 
-test('Models endpoint returns qwen3.6-plus and qwen3.6-plus-no-thinking', async () => {
+test('Models endpoint returns qwen3.6-plus without thinking variants', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input: any) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -39,7 +39,7 @@ test('Models endpoint returns qwen3.6-plus and qwen3.6-plus-no-thinking', async 
     assert.strictEqual(body.object, 'list');
     assert.ok(Array.isArray(body.data));
     assert.ok(body.data.some((m: any) => m.id === 'qwen3.6-plus'));
-    assert.ok(body.data.some((m: any) => m.id === 'qwen3.6-plus-no-thinking'));
+    assert.ok(!body.data.some((m: any) => m.id.endsWith('-thinking')), 'Catalog must not contain -thinking/-no-thinking duplicates');
   } finally {
     globalThis.fetch = originalFetch;
   }

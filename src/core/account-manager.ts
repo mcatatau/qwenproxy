@@ -295,7 +295,9 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
     const readyViable = viable.filter(a => isAccountReady(a.id))
     const pool = readyViable.length > 0 ? readyViable : viable
     const minLoad = Math.min(...pool.map(a => getAccountActiveLoad(a.id)))
-    return pool.find(a => getAccountActiveLoad(a.id) === minLoad)!
+    const chosen = pool.find(a => getAccountActiveLoad(a.id) === minLoad)!
+    currentIndex = (accounts.indexOf(chosen) + 1) % accounts.length
+    return chosen
   }
 
   // Healthy accounts exist but are all busy (in-use): return null so the caller

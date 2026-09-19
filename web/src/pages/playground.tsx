@@ -16,12 +16,6 @@ function fmtContext(n?: number): string {
   return String(n)
 }
 
-function variantOf(id: string): 'base' | 'thinking' | 'no-thinking' {
-  if (id.endsWith('-thinking')) return 'thinking'
-  if (id.endsWith('-no-thinking')) return 'no-thinking'
-  return 'base'
-}
-
 export function PlaygroundPage() {
   const { t } = useTranslation()
   const [catalog, setCatalog] = useState<CatalogModel[]>([])
@@ -29,7 +23,7 @@ export function PlaygroundPage() {
   const [systemPrompt, setSystemPrompt] = useState('')
   const [userMessage, setUserMessage] = useState('')
   const [stream, setStream] = useState(true)
-  const [thinking, setThinking] = useState(false)
+  const [reasoningEffort, setReasoningEffort] = useState('auto')
   const [loading, setLoading] = useState(false)
   const [response, setResponse] = useState('')
   const [thinkingContent, setThinkingContent] = useState('')
@@ -48,7 +42,7 @@ export function PlaygroundPage() {
         setModel((current) => {
           if (current && list.some((m) => m.id === current)) return current
           const preferred = [...list].sort((a, b) => b.requestCount - a.requestCount).find((m) => m.id === 'qwen-plus')
-          return (preferred ?? [...list].find((m) => variantOf(m.id) === 'base') ?? list[0])?.id ?? 'qwen-plus'
+          return (preferred ?? list[0])?.id ?? 'qwen-plus'
         })
       })
       .catch(() => {})
@@ -68,9 +62,9 @@ export function PlaygroundPage() {
     if (systemPrompt.trim()) messages.push({ role: 'system', content: systemPrompt.trim() })
     messages.push({ role: 'user', content: userMessage.trim() })
     const payload: Parameters<typeof api.testChat>[0] = { model, messages, stream }
-    if (thinking) payload.thinking = { type: 'enabled' }
+    if (reasoningEffort !== 'auto') payload.reasoning_effort = reasoningEffort
     return payload
-  }, [model, systemPrompt, userMessage, stream, thinking])
+  }, [model, systemPrompt, userMessage, stream, reasoningEffort])
 
   async function handleSend() {
     if (!userMessage.trim()) return
@@ -225,9 +219,6 @@ export function PlaygroundPage() {
               {selectedModel ? (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Badge variant="outline" className="font-normal">ctx {fmtContext(selectedModel.contextWindow)}</Badge>
-                  {variantOf(selectedModel.id) !== 'base' && (
-                    <Badge variant="outline" className="font-normal">{variantOf(selectedModel.id)}</Badge>
-                  )}
                 </div>
               ) : null}
             </div>
@@ -268,8 +259,21 @@ export function PlaygroundPage() {
                 <Label htmlFor="strm" className="cursor-pointer">{t('playground.stream')}</Label>
               </div>
               <div className="flex items-center gap-2">
-                <Switch id="thk" checked={thinking} onCheckedChange={setThinking} />
-                <Label htmlFor="thk" className="cursor-pointer">{t("playground.thinkingLabel")}</Label>
+                <Label>{t('playground.reasoningEffort')}</Label>
+                <Select value={reasoningEffort} onValueChange={setReasoningEffort}>
+                  <SelectTrigger className="w-32">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">{t('playground.reasoningEffortAuto')}</SelectItem>
+                    <SelectItem value="none">none</SelectItem>
+                    <SelectItem value="low">low</SelectItem>
+                    <SelectItem value="medium">medium</SelectItem>
+                    <SelectItem value="high">high</SelectItem>
+                    <SelectItem value="xhigh">xhigh</SelectItem>
+                    <SelectItem value="max">max</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </div>
 

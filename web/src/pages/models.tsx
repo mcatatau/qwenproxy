@@ -8,29 +8,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { useTranslation } from 'react-i18next'
-
-type VariantFilter = 'all' | 'base' | 'thinking' | 'no-thinking'
 
 function formatContextWindow(n?: number): string {
   if (n == null) return '—'
   if (n >= 1000000) return `${n / 1000000}M`
   if (n >= 1000) return `${Math.round(n / 1000)}K`
   return String(n)
-}
-
-function variantOf(id: string): 'base' | 'thinking' | 'no-thinking' {
-  if (id.endsWith('-thinking')) return 'thinking'
-  if (id.endsWith('-no-thinking')) return 'no-thinking'
-  return 'base'
-}
-
-const VARIANT_LABEL: Record<Exclude<VariantFilter, 'all'>, string> = {
-  base: 'Base',
-  thinking: 'Thinking',
-  'no-thinking': 'No thinking',
 }
 
 const ABILITY_LABEL: Record<string, string> = {
@@ -49,7 +34,6 @@ export function ModelsPage() {
   const [data, setData] = useState<{ catalog: CatalogModel[]; used: CatalogModel[] } | null>(null)
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [variant, setVariant] = useState<VariantFilter>('all')
 
   const load = useCallback(async () => {
     try {
@@ -99,12 +83,11 @@ export function ModelsPage() {
     const term = search.toLowerCase()
     return data.catalog
       .filter((m) => m.id.toLowerCase().includes(term) || (m.name ?? '').toLowerCase().includes(term))
-      .filter((m) => variant === 'all' || variantOf(m.id) === variant)
       .sort((a, b) => {
         if (b.requestCount !== a.requestCount) return b.requestCount - a.requestCount
         return a.id.localeCompare(b.id)
       })
-  }, [data, search, variant])
+  }, [data, search])
 
   if (loading) {
     return (
@@ -190,9 +173,6 @@ export function ModelsPage() {
               {mostUsed.slice(0, 10).map((m, i) => (
                 <div key={m.id} className="flex items-center gap-3">
                   <span className="w-5 shrink-0 text-right font-mono text-xs text-muted-foreground">{i + 1}</span>
-                  <Badge variant="outline" className="w-16 shrink-0 justify-center text-[10px]">
-                    {VARIANT_LABEL[variantOf(m.id)]}
-                  </Badge>
                   <span className="min-w-0 flex-1 truncate font-mono text-xs">{m.id}</span>
                   <div className="h-2 w-32 shrink-0 overflow-hidden rounded-full bg-muted sm:w-48">
                     <div
@@ -229,17 +209,6 @@ export function ModelsPage() {
                 className="pl-9"
               />
             </div>
-            <Select value={variant} onValueChange={(v) => setVariant(v as VariantFilter)}>
-              <SelectTrigger className="w-full sm:w-40">
-                <SelectValue placeholder={t('models.variantPlaceholder')} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">{t("models.filterAll")}</SelectItem>
-                <SelectItem value="base">{t("models.filterBase")}</SelectItem>
-                <SelectItem value="thinking">{t("models.filterThinking")}</SelectItem>
-                <SelectItem value="no-thinking">{t("models.filterNoThinking")}</SelectItem>
-              </SelectContent>
-            </Select>
           </div>
         </CardHeader>
         <CardContent>
@@ -269,9 +238,6 @@ export function ModelsPage() {
                       <div className="flex flex-col gap-1">
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-sm">{m.id}</span>
-                          <Badge variant="outline" className="text-[10px]">
-                            {VARIANT_LABEL[variantOf(m.id)]}
-                          </Badge>
                           {m.requestCount > 0 && (
                             <Badge variant="secondary" className="text-[10px]">{t("models.inUseBadge")}</Badge>
                           )}

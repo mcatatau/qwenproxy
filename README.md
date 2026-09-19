@@ -22,7 +22,7 @@ Proxy API local compatível com OpenAI que roteia requisições para os modelos 
 - **Hybrid Sessions** — Sessões de conversa persistentes (SQLite) com envio econômico, verificação de histórico e guard contra respostas degeneradas ("Yes").
 - **Guest Mode** — Modo convidado sem necessidade de login, usando a API pública do Qwen.
 - **SQLite Storage** — Contas, usuários e sessões em banco SQLite (WAL mode).
-- **Reasoning Support** — Suporte completo ao modo de pensamento (thinking) dos modelos Qwen.
+- **Reasoning Support** — Controle do modo de pensamento (thinking) dos modelos Qwen via `reasoning_effort` no body do `/v1/chat/completions` (valores: `none`, `low`, `medium`, `high`, `xhigh`, `max`). `none` desativa o thinking; qualquer outro valor válido ativa. Os sufixos `-thinking`/`-no-thinking` foram removidos do catálogo do `/v1/models`, mas continuam aceitos nas requisições como fallback legado quando `reasoning_effort` não é enviado — que tem precedência sobre o sufixo.
 - **Multimodal Upload** — Envio de imagens, vídeos, áudios e documentos via `/v1/upload` com integração ao OSS do Qwen (texto embutido no prompt).
 - **Tool Execution** — Sistema de execução de ferramentas locais integrado ao fluxo do chat.
 - **Session Persistence** — Perfil de navegador persistente por conta em `qwen_profiles/`.
@@ -219,6 +219,7 @@ curl http://localhost:3000/v1/chat/completions \
   -d '{
     "model": "qwen-plus",
     "messages": [{"role": "user", "content": "Hello!"}],
+    "reasoning_effort": "high",
     "stream": true
   }'
 ```

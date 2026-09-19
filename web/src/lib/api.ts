@@ -242,7 +242,7 @@ export const api = {
   },
   models: () => request<ModelsData>('/models'),
   usage: (limit?: number) => request<UsageData>(`/usage${limit ? `?limit=${limit}` : ''}`),
-  testChat: async (payload: { model: string; messages: Array<{ role: string; content: string }>; stream: boolean; thinking?: { type: string } }): Promise<Response> => {
+  testChat: async (payload: { model: string; messages: Array<{ role: string; content: string }>; stream: boolean; reasoning_effort?: string }): Promise<Response> => {
     return fetch('/admin/api/test-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

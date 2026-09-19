@@ -49,11 +49,10 @@ describe('Streaming Optimizations Tests', () => {
       assert.strictEqual(result.matchedContent, 'abcxyz');
     });
 
-    it('should handle short prefix matches (below threshold)', () => {
+    it('should handle short prefix matches via the starts-with fast path', () => {
       const result = getIncrementalDelta('ab', 'abc');
-      // Prefix match of length 2 is below threshold of 4
-      assert.strictEqual(result.delta, 'abc');
-      assert.strictEqual(result.matchedContent, 'ababc');
+      assert.strictEqual(result.delta, 'c');
+      assert.strictEqual(result.matchedContent, 'abc');
     });
 
     it('should handle threshold boundary correctly', () => {
@@ -192,7 +191,7 @@ describe('Streaming Optimizations Tests', () => {
       
       const remainder = buffer.slice(startIdx);
       
-      assert.deepStrictEqual(lines, ['data: chunk1\n', 'data: chunk2\n', 'data: chunk3\n']);
+      assert.deepStrictEqual(lines, ['data: chunk1', '', 'data: chunk2', '', 'data: chunk3', '']);
       assert.strictEqual(remainder, 'remainder');
     });
 

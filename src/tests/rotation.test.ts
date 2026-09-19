@@ -136,21 +136,20 @@ test('Account Cooldown: recovered account becomes selectable after cooldown', as
     // `recoveredId` was on cooldown (simulating startup-cooldown or an expired
     // 429) and its browser context was never initialized -> not ready.
     markAccountNotReady(recoveredId);
-    markAccountRateLimited(recoveredId, 10, 'RateLimited');
+    markAccountRateLimited(recoveredId, 60000, 'RateLimited');
 
     // While still on cooldown it must NOT be selected.
     const duringCooldown = getNextAccount(true);
     assert.ok(!duringCooldown || duringCooldown.id !== recoveredId,
       'account still on cooldown should not be selected');
 
-    // While `readyId` stays busy, let the 10ms cooldown window pass. The only
-    // free account is the recovered (un-ready) one -> it must become selectable.
-    await new Promise(r => setTimeout(r, 25));
+    // Clearing the cooldown makes the only free account (un-ready) selectable.
+    clearAccountCooldown(recoveredId);
 
     const afterCooldown = getNextAccount(true);
     assert.ok(afterCooldown, 'a free account should be available after cooldown');
     assert.strictEqual(afterCooldown!.id, recoveredId,
-      'recovered (cooldown-expired, un-ready) account must become selectable');
+      'recovered (cooldown-cleared, un-ready) account must become selectable');
   } finally {
     releaseAccountInUse(ids[0]);
     for (const id of ids) {

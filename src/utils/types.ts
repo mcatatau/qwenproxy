@@ -54,6 +54,7 @@ export interface OpenAIRequest {
   stream_options?: {
     include_usage?: boolean;
   };
+  reasoning_effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 }
 
 // --- Response Types ---

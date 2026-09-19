@@ -170,6 +170,12 @@ export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
+
+    const VALID_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+    if (body.reasoning_effort !== undefined && !VALID_REASONING_EFFORTS.includes(body.reasoning_effort)) {
+      return c.json({ error: { message: `Invalid reasoning_effort: '${body.reasoning_effort}'. Valid values: ${VALID_REASONING_EFFORTS.join(', ')}` } }, 400);
+    }
+
     metrics.increment('requests.completions');
 
     if (user) {
@@ -356,7 +362,9 @@ export async function chatCompletions(c: Context) {
       if (compactManifest) finalPrompt += `\n\n${compactManifest}`;
     }
 
-    const isThinkingModel = !body.model.includes('no-thinking');
+    const isThinkingModel = body.reasoning_effort !== undefined
+      ? body.reasoning_effort !== 'none'
+      : !body.model.includes('no-thinking');
 
     const rawSessionKey = (typeof bodyAny.user === 'string' && bodyAny.user.trim())
       ? bodyAny.user.trim()

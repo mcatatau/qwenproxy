@@ -1,8 +1,9 @@
 import { getBasicHeaders, waitForAccountPage } from './playwright.js';
 import { recordAccountBlock } from '../core/account-isolation.js';
 import { config } from '../core/config.js';
-import { getRuntimeInt } from '../core/runtime-config.js';
+import { getRuntimeInt, getRuntimeBool } from '../core/runtime-config.js';
 import { QwenUpstreamError } from './error-handler.js';
+import { getClientHintsHeaders } from './browser-manager.js';
 import type { Page } from 'playwright';
 import crypto from 'crypto';
 import { sleep } from '../utils/sleep.js';
@@ -76,6 +77,47 @@ async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, s
   };
 }
 
+function buildWarmPoolNodeHeaders(headers: Record<string, string>, accountId?: string): Record<string, string> {
+  return {
+    'accept': 'application/json, text/plain, */*',
+    'content-type': 'application/json',
+    'cookie': headers['cookie'],
+    'origin': 'https://chat.qwen.ai',
+    'referer': accountId === 'guest' ? 'https://chat.qwen.ai/c/guest' : 'https://chat.qwen.ai/',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'timezone': CACHED_TIMEZONE,
+    'user-agent': headers['user-agent'],
+    'version': QWEN_WEB_VERSION,
+    'x-request-id': crypto.randomUUID(),
+    'bx-v': headers['bx-v'],
+    'bx-ua': headers['bx-ua'],
+    'bx-umidtoken': headers['bx-umidtoken'],
+    'source': 'web',
+    ...getClientHintsHeaders(accountId),
+  };
+}
+
+async function nodeJsonFetch<T>(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number }): Promise<{ status: number; body: string; json: T | null }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs || 30000);
+  try {
+    const response = await fetch(url, {
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      body: options.body,
+      signal: controller.signal,
+    });
+    const body = await response.text();
+    let json: T | null = null;
+    try { json = JSON.parse(body) as T; } catch { /* not json */ }
+    return { status: response.status, body, json };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function browserJsonFetch<T>(page: Page, url: string, options: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number }): Promise<{ status: number; body: string; json: T | null }> {
   return await page.evaluate(async ({ url, options }) => {
     const controller = new AbortController();
@@ -97,12 +139,28 @@ async function browserJsonFetch<T>(page: Page, url: string, options: { method?: 
   }, { url, options });
 }
 
-async function createRealQwenChat(header: Record<string, string>, accountId?: string): Promise<string> {
+function extractChatId(json: any): string {
+  const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
+  if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
+  return chatId;
+}
+
+function throwIfErrorJson(json: any): void {
+  if (json && json.success === false) {
+    const code = json.data?.code || json.code || 'UpstreamError';
+    const details = json.data?.details || json.message || 'Qwen returned an error';
+    const wait = json.data?.num !== undefined ? ` Wait about ${json.data.num} hour(s) before trying again.` : '';
+    let status = 502;
+    if (code === 'RateLimited') status = 429;
+    throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
+  }
+}
+
+async function createRealQwenChat(headers: Record<string, string>, accountId?: string): Promise<string> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     return process.env.TEST_SESSION_ID || `mock-chat-${crypto.randomUUID()}`;
   }
 
-  const page = await waitForAccountPage(accountId, 15000);
   const body = JSON.stringify({
     title: 'Nova Conversa',
     models: ['qwen3.7-plus'],
@@ -111,6 +169,33 @@ async function createRealQwenChat(header: Record<string, string>, accountId?: st
     timestamp: Date.now(),
     project_id: '',
   });
+
+  const useDirect = getRuntimeBool('QWEN_DIRECT_FETCH', config.directFetch.enabled);
+  if (useDirect && accountId && accountId !== 'guest' && accountId !== 'global') {
+    try {
+      const result = await nodeJsonFetch<any>('https://chat.qwen.ai/api/v2/chats/new', {
+        method: 'POST',
+        headers: buildWarmPoolNodeHeaders(headers, accountId),
+        body,
+        timeoutMs: config.timeouts.http,
+      });
+
+      if (result.status === 429) {
+        throw new QwenUpstreamError('Qwen upstream error: RateLimited: Too many requests.', 'RateLimited', 429);
+      }
+      if (result.status && result.status >= 400) {
+        throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
+      }
+      const json = result.json ?? JSON.parse(result.body);
+      throwIfErrorJson(json);
+      return extractChatId(json);
+    } catch (err: any) {
+      if (err instanceof QwenUpstreamError) throw err;
+      console.warn(`[WarmPool] Direct HTTP chat creation failed for ${accountId}, falling back to browser: ${err.message}`);
+    }
+  }
+
+  const page = await waitForAccountPage(accountId, 15000);
 
   if (page) {
     try {
@@ -135,17 +220,8 @@ async function createRealQwenChat(header: Record<string, string>, accountId?: st
         throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
       }
       const json = result.json ?? JSON.parse(result.body);
-      if (json && json.success === false) {
-        const code = json.data?.code || json.code || 'UpstreamError';
-        const details = json.data?.details || json.message || 'Qwen returned an error';
-        const wait = json.data?.num !== undefined ? ` Wait about ${json.data.num} hour(s) before trying again.` : '';
-        let status = 502;
-        if (code === 'RateLimited') status = 429;
-        throw new QwenUpstreamError(`Qwen upstream error: ${code}: ${details}.${wait}`, code, status);
-      }
-      const chatId = json.chat_id || json.id || json.data?.chat_id || json.data?.id;
-      if (!chatId) throw new Error(`Unexpected chat response: ${JSON.stringify(json).slice(0, 200)}`);
-      return chatId;
+      throwIfErrorJson(json);
+      return extractChatId(json);
     } catch (err: any) {
       if (err instanceof QwenUpstreamError) throw err;
       throw new Error(`Browser chat creation failed with active Qwen page: ${err.message}`, { cause: err });
@@ -155,11 +231,46 @@ async function createRealQwenChat(header: Record<string, string>, accountId?: st
   throw new Error(`Cannot create Qwen chat outside an active Qwen browser page for ${accountId || 'global'}. Refusing direct fetch to avoid TMD challenge.`);
 }
 
+function parseUnusedChats(body: string): string[] {
+  try {
+    const json = JSON.parse(body);
+    if (!json.success || !Array.isArray(json.data)) return [];
+    const unused: string[] = [];
+    for (const chat of json.data) {
+      if (chat.title === 'Nova Conversa' && chat.created_at === chat.updated_at) {
+        unused.push(chat.id);
+      }
+    }
+    return unused;
+  } catch {
+    return [];
+  }
+}
+
 async function fetchUnusedChats(headers: Record<string, string>, accountId?: string): Promise<string[]> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return [];
 
-  const page = await waitForAccountPage(accountId, 10000);
   const url = 'https://chat.qwen.ai/api/v2/chats/?page=1&exclude_project=true';
+
+  const useDirect = getRuntimeBool('QWEN_DIRECT_FETCH', config.directFetch.enabled);
+  if (useDirect) {
+    try {
+      const nodeHeaders = { ...buildWarmPoolNodeHeaders(headers, accountId) };
+      delete nodeHeaders['content-type'];
+      const result = await nodeJsonFetch<any>(url, {
+        method: 'GET',
+        headers: nodeHeaders,
+        timeoutMs: config.timeouts.http,
+      });
+      if (result.status && result.status < 400 && result.body) {
+        return parseUnusedChats(result.body);
+      }
+    } catch (err: any) {
+      console.warn(`[WarmPool] Direct HTTP chat list fetch failed for ${accountId || 'global'}, falling back to browser: ${err.message}`);
+    }
+  }
+
+  const page = await waitForAccountPage(accountId, 10000);
   const reqHeaders: Record<string, string> = {
     'accept': 'application/json, text/plain, */*',
     'x-request-id': crypto.randomUUID(),
@@ -185,20 +296,7 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
   }
 
   if (!body) return [];
-
-  try {
-    const json = JSON.parse(body);
-    if (!json.success || !Array.isArray(json.data)) return [];
-    const unused: string[] = [];
-    for (const chat of json.data) {
-      if (chat.title === 'Nova Conversa' && chat.created_at === chat.updated_at) {
-        unused.push(chat.id);
-      }
-    }
-    return unused;
-  } catch {
-    return [];
-  }
+  return parseUnusedChats(body);
 }
 
 async function refillPoolForAccount(accountId: string) {

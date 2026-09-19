@@ -1,6 +1,6 @@
 export { RetryableQwenStreamError, QwenUpstreamError } from './error-handler.js';
 export { getWarmedChat, warmAllPools } from './warm-pool.js';
-export { createQwenStream, updateSessionParent, disableNativeTools, fetchQwenModels, fetchQwenChatHistory } from './stream-creator.js';
+export { createQwenStream, updateSessionParent, disableNativeTools, fetchQwenChatHistory } from './stream-creator.js';
 export type { QwenMessage, QwenPayload, QwenFileEntry, CreateQwenStreamOptions, QwenChatHistoryResult, QwenChatHistoryMessage } from './stream-creator.js';
 export {
   getSession,

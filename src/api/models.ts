@@ -22,17 +22,14 @@ function buildCatalog(rawModels: any[]): any[] {
     context_window: model.info?.meta?.max_context_length,
     capabilities: capabilitiesOf(model),
   })
-  return [
-    ...rawModels.map((model: any) => entry(model, model.id, model.name)),
-    ...rawModels.map((model: any) => entry(model, `${model.id}-thinking`, model.name ? `${model.name} (Thinking)` : undefined)),
-    ...rawModels.map((model: any) => entry(model, `${model.id}-no-thinking`, model.name ? `${model.name} (No Thinking)` : undefined)),
-  ]
+  return rawModels.map((model: any) => entry(model, model.id, model.name))
 }
 
 /**
- * Fetches the full Qwen model catalog (base + thinking + no-thinking variants)
- * with a dedicated admin-side cache, so the admin dashboard can show every
- * available model without coupling to the public /v1/models cache keys.
+ * Fetches the full Qwen model catalog with a dedicated admin-side cache, so
+ * the admin dashboard can show every available model without coupling to the
+ * public /v1/models cache keys. Thinking mode is controlled per-request via
+ * `reasoning_effort` (or the legacy -thinking/-no-thinking suffixes).
  */
 export async function fetchFullModelCatalog(): Promise<any[]> {
   const cacheKey = 'models:full-catalog'

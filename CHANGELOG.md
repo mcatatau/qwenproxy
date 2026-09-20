@@ -1,3 +1,10 @@
+# [1.32.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.31.0...v1.32.0) (2026-09-20)
+
+
+### Features
+
+* support think-phase reasoning deltas and function shorthand tool calls ([a1ba577](https://github.com/pedrofariasx/qwenproxy/commit/a1ba5777eb44cbf0516c686b36370bc38df74a77))
+
 # [1.31.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.30.0...v1.31.0) (2026-09-19)
 
 

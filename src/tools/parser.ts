@@ -189,6 +189,23 @@ function inferToolNameFromParameters(args: Record<string, unknown>, tools: Funct
   return '';
 }
 
+function parseFunctionShorthandToolCall(
+  block: string
+): { name: string; arguments: Record<string, unknown> } | null {
+  const fnMatch = block.match(/<function=([^\s>]+)>/i);
+  if (!fnMatch) return null;
+
+  const args: Record<string, unknown> = {};
+  const paramRe = /<parameter=([^\s>]+)>([\s\S]*?)<\/parameter>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = paramRe.exec(block)) !== null) {
+    args[match[1]] = coerceParameterValue(match[2]);
+  }
+
+  if (Object.keys(args).length === 0) return null;
+  return { name: fnMatch[1], arguments: args };
+}
+
 /**
  * Parse Hermes-style XML <parameter name="...">value</parameter> format.
  */
@@ -507,6 +524,18 @@ export class StreamingToolParser {
 
     t = unescapeDoubleEscaped(t);
 
+    const shorthandParsed = parseFunctionShorthandToolCall(t);
+    if (shorthandParsed) {
+      result.toolCalls.push({
+        id: `call_${crypto.randomUUID()}`,
+        name: shorthandParsed.name,
+        arguments: shorthandParsed.arguments,
+      });
+      this.emittedToolCallCount++;
+      this.pendingLeadIn = '';
+      return;
+    }
+
     const xmlParsed = parseXmlParameterToolCall(t, this.currentOpenTag, this.tools);
     if (xmlParsed) {
       result.toolCalls.push({
@@ -585,6 +614,15 @@ export class StreamingToolParser {
   private recoverAllToolCalls(block: string): ParsedToolCall[] {
     const unescaped = unescapeDoubleEscaped(block);
     const out: ParsedToolCall[] = [];
+
+    const shorthandParsed = parseFunctionShorthandToolCall(unescaped);
+    if (shorthandParsed) {
+      return [{
+        id: `call_${crypto.randomUUID()}`,
+        name: shorthandParsed.name,
+        arguments: shorthandParsed.arguments,
+      }];
+    }
 
     const xmlParsed = parseXmlParameterToolCall(unescaped, this.currentOpenTag, this.tools);
     if (xmlParsed) {

@@ -332,6 +332,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                     foundStr = true;
                   }
                 }
+              } else if (delta.phase === 'think') {
+                isThinkingChunk = true;
+                if (delta.content) {
+                  vStr = delta.content;
+                  foundStr = true;
+                }
               } else if (delta.phase === 'answer') {
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {

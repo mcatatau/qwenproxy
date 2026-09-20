@@ -287,6 +287,15 @@ export class QwenStreamParser {
       return null;
     }
 
+    if (delta.phase === 'thinking' || delta.phase === 'think') {
+      const content = delta.content ?? '';
+      if (content) {
+        this._state.reasoningBuffer += content;
+        return { content, isThinking: true };
+      }
+      return null;
+    }
+
     if (delta.phase === 'answer') {
       const content = delta.content ?? '';
       return { content, isThinking: false };
